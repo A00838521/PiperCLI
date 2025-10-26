@@ -1,0 +1,10 @@
+{
+  "project": {
+    "default_dir": "/home/opsystem/Downloads/MediaTry"
+  },
+  "defaults": {
+    "max_ai_bytes": 83886080,
+    "max_ai_file_bytes": 8388608,
+    "smoke_python_default": true
+  }
+}

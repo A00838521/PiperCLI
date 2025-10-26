@@ -1,0 +1,33 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Envs
+.venv/
+.env
+
+# Logs y cache
+logs/
+*.log
+.cache/
+
+# Node
+node_modules/
+
+# Go
+bin/
+
+# Editor/OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Backups
+*.tar.gz
+*.zip
+
+# Estado local de Piper (si existiera fuera del repo)
+# ~/.local/share/piper se guarda fuera del repo; este repo puede llevar una copia en piper-cli/state/
