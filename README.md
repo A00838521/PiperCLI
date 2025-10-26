@@ -1,7 +1,5 @@
 # Piper CLI (instalador en Linux, usuario)
 
-[![CI](https://github.com/A00838521/PiperCLI/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/A00838521/PiperCLI/actions/workflows/ci.yml)
-
 Asistente local tipo Copilot que convierte prompts en proyectos, con integración a Ollama, TTS opcional y verificación rápida.
 
 ## Instalación rápida (local)
