@@ -1,6 +1,6 @@
 # Piper CLI (instalador en Linux, usuario)
 
-[![CI](https://github.com/A00838521/PiperCLI/actions/workflows/ci.yml/badge.svg)](https://github.com/A00838521/PiperCLI/actions/workflows/ci.yml)
+[![CI](https://github.com/A00838521/PiperCLI/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/A00838521/PiperCLI/actions/workflows/ci.yml)
 
 Asistente local tipo Copilot que convierte prompts en proyectos, con integración a Ollama, TTS opcional y verificación rápida.
 
@@ -17,6 +17,7 @@ bash install.sh --from-git https://github.com/<usuario>/<repo>.git --branch main
 ```
 
 El instalador:
+
 - Copia Piper a `~/.local/share/piper-cli/src` y crea `~/.local/bin/piper`.
 - Instala y arranca Ollama como servicio de usuario (o fallback sin systemd).
 - Restaura configuración si existe `state/config.json` o si pasas `--with-config` / `--restore`.
@@ -91,8 +92,8 @@ bash bootstrap.sh
 - Por defecto se asegura `mistral:7b-instruct` y `phi3:mini`.
 - Forzar modelo rápido por ejecución: `--fast`.
 - Variables:
-  - `PIPER_OLLAMA_MODEL`: modelo por defecto.
-  - `OLLAMA_HOST`: host de Ollama (por defecto `http://127.0.0.1:11434`).
+   - `PIPER_OLLAMA_MODEL`: modelo por defecto.
+   - `OLLAMA_HOST`: host de Ollama (por defecto `http://127.0.0.1:11434`).
 
 ## Seguridad y límites
 
