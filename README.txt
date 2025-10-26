@@ -109,11 +109,4 @@ rm -f ~/.local/bin/piper
 rm -rf ~/.local/share/piper
 ```
 
-## CI (GitHub Actions) y badge
 
-- El “badge” es la imagen de estado al inicio del archivo. Muestra si la última ejecución del flujo de CI pasó (verde) o falló (rojo). Al hacer clic te lleva a la página del flujo.
-- GitHub Actions es la plataforma de CI/CD de GitHub. Cada push corre nuestro flujo definido en `.github/workflows/ci.yml`.
-- ¿Qué valida este flujo?:
-  - Sintaxis de scripts bash: `install.sh`, `backup_state.sh`, `bootstrap.sh` y `bin/piper` (con `bash -n`).
-  - Que el CLI de Python importea correctamente: intenta cargar `src/piper_cli.py` y verificar que exponga funciones clave.
-- Beneficio: detecta errores de sintaxis o importación antes de que alguien intente instalarlo en otra máquina.
