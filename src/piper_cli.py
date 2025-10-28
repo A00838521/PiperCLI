@@ -22,6 +22,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Tuple
+import time
 import json
 import urllib.request
 import urllib.error
@@ -32,7 +33,8 @@ import py_compile
 import traceback
 import shutil
 from html.parser import HTMLParser
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs, quote_plus, unquote
+import platform
 
 try:
     from piper_tts import speak  # noqa: F401
@@ -68,6 +70,308 @@ def mkdirp(p: Path) -> None:
 def write_file(path: Path, content: str) -> None:
     mkdirp(path.parent)
     path.write_text(content, encoding="utf-8")
+
+
+def _maybe_save_output(base: Path, save_path: str | None, content: str, *, append: bool = False) -> None:
+    """Si se proporcionó una ruta de guardado, valida y escribe el contenido.
+    Usa validación estricta para asegurar que la ruta quede dentro de 'base'.
+    """
+    if not save_path:
+        return
+    ok, rel, target = _validate_ai_relpath(base, save_path)
+    if not ok or target is None:
+        motivo = rel or "inválida"
+        print(f"[SKIP] No se guardó salida en '{save_path}' (razón: {motivo})")
+        return
+    try:
+        if append and target.exists():
+            with target.open("a", encoding="utf-8") as fh:
+                fh.write(("\n" if content and not content.endswith("\n") else "") + content)
+        else:
+            write_file(target, content)
+        print(f"[OK] Salida guardada en {rel}")
+    except Exception as e:
+        print(f"[ERROR] No se pudo guardar '{rel}': {e}")
+
+
+# -------------------- UX Mejorada (progreso, ASCII mayordomo) --------------------
+
+def _ascii_butler(lines: list[str]) -> str:
+    # Caja ASCII simple sin figura, orientada a resúmenes legibles
+    bubble = [f"  | {ln}" for ln in lines]
+    width = max([len(s) for s in bubble], default=0)
+    top = "  +" + "-" * (width + 2) + "+" if width else ""
+    bottom = top
+    body = [f"  | {ln.ljust(width)} |" for ln in [b[4:] for b in bubble]] if width else []
+    frame = ([top] + body + [bottom]) if width else bubble
+    header = ["  PIPER — asistente de proyecto local"]
+    return "\n".join(header + frame)
+
+
+def _ascii_banner() -> str:
+    # Banner de arranque global (evitar secuencias ANSI)
+    return "\n".join([
+        r"",
+        r"         ____    ______   ____    ____    ____        ",
+        r"        /\  _`\ /\__  _\ /\  _`\ /\  _`\ /\  _`\      ",
+        r"        \ \ \L\ \/_/\ \/ \ \ \L\ \ \ \L\_\ \ \L\ \    ",
+        r"         \ \ ,__/  \ \ \  \ \ ,__/\ \  _\L\ \ ,  /    ",
+        r"          \ \ \/    \_\ \__\ \ \/  \ \ \L\ \ \ \\ \   ",
+        r"           \ \_\    /\_____\\ \_\   \ \____/\ \_\ \_\ ",
+        r"            \/_/    \/_____/ \/_/    \/___/  \/_/\/ / ",
+        r"",
+        r" ------------  PIPER — asistente de proyecto local  ------------"
+    ])
+
+
+_PHASE_STACK: list[tuple[str, float, int]] = []  # (name, start_ts, est)
+
+def progress_start(name: str, estimated_seconds: int | None = None) -> None:
+    est = int(estimated_seconds or 0)
+    _PHASE_STACK.append((name, time.time(), est))
+    est_txt = f" ~{est}s" if est else ""
+    print(f"⏳ {name}{est_txt}...")
+
+
+def progress_end() -> None:
+    if not _PHASE_STACK:
+        return
+    name, start, est = _PHASE_STACK.pop()
+    dur = time.time() - start
+    print(f"✓ {name} — {dur:.1f}s")
+
+
+def with_progress(name: str, est_seconds: int, func, *args, **kwargs):
+    """Ejecuta func(*args, **kwargs) mostrando una fase con tiempo estimado y duración real."""
+    try:
+        progress_start(name, est_seconds)
+        return func(*args, **kwargs)
+    finally:
+        progress_end()
+
+
+def _dir_tree(root: Path, *, max_depth: int = 2, max_entries: int = 100) -> list[str]:
+    root = root.resolve()
+    lines: list[str] = []
+    count = 0
+
+    def walk(d: Path, prefix: str, depth: int) -> None:
+        nonlocal count
+        if depth > max_depth or count >= max_entries:
+            return
+        try:
+            entries = sorted(d.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+        except Exception:
+            return
+        for i, p in enumerate(entries):
+            if count >= max_entries:
+                return
+            branch = "└── " if i == len(entries) - 1 else "├── "
+            lines.append(prefix + branch + p.name)
+            count += 1
+            if p.is_dir():
+                next_prefix = prefix + ("    " if i == len(entries) - 1 else "│   ")
+                walk(p, next_prefix, depth + 1)
+
+    walk(root, "", 0)
+    return lines
+
+
+# -------------------- Entrada interactiva con cancelación q() --------------------
+
+class _UserCanceled(Exception):
+    pass
+
+
+def _ask_input(prompt: str) -> str:
+    try:
+        s = input(prompt)
+    except EOFError:
+        raise _UserCanceled()
+    if s is None:
+        raise _UserCanceled()
+    s2 = s.strip()
+    if s2.lower() == "q()":
+        raise _UserCanceled()
+    return s2
+
+
+# -------------------- Intents locales (fecha de hoy) --------------------
+
+def _normalize_text(s: str) -> str:
+    t = (s or "").lower()
+    # normalización simple de acentos comunes en español
+    t = (t
+         .replace("á", "a").replace("é", "e").replace("í", "i")
+         .replace("ó", "o").replace("ú", "u").replace("ü", "u")
+         .replace("ñ", "n"))
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def _is_date_query(s: str) -> bool:
+    t = _normalize_text(s)
+    patt = [
+        "que dia es hoy",
+        "que dia es",
+        "que fecha es hoy",
+        "fecha de hoy",
+        "fecha hoy",
+        "what day is it",
+        "what day is today",
+        "today s date",
+        "todays date",
+        "date today",
+    ]
+    return any(p in t for p in patt)
+
+
+def _date_today_text() -> str:
+    now = datetime.now()
+    dias = ["lunes", "martes", "miercoles", "jueves", "viernes", "sabado", "domingo"]
+    meses = [
+        "enero", "febrero", "marzo", "abril", "mayo", "junio",
+        "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"
+    ]
+    dia = dias[now.weekday()]
+    mes = meses[now.month - 1]
+    return f"Hoy es {dia} {now.day} de {mes} de {now.year}."
+
+
+def _is_time_query(s: str) -> bool:
+    t = _normalize_text(s)
+    patt = [
+        "que hora es",
+        "hora actual",
+        "hora local",
+        "hora ahora",
+        "what time is it",
+        "current time",
+        "time now",
+    ]
+    return any(p in t for p in patt)
+
+
+def _time_now_text() -> str:
+    now = datetime.now()
+    return now.strftime("La hora local es %H:%M:%S")
+
+
+def _is_cwd_query(s: str) -> bool:
+    t = _normalize_text(s)
+    patt = [
+        "directorio actual",
+        "carpeta actual",
+        "donde estoy",
+        "ruta actual",
+        "current directory",
+        "working directory",
+        "pwd",
+    ]
+    return any(p in t for p in patt)
+
+
+def _cwd_text() -> str:
+    try:
+        return f"Directorio actual: {Path.cwd()}"
+    except Exception:
+        return "No pude determinar el directorio actual."
+
+
+_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+
+
+def _extract_urls(s: str) -> list[str]:
+    return _URL_RE.findall(s or "")
+
+
+def _wants_web_summary(s: str) -> bool:
+    t = _normalize_text(s)
+    keys = ["resume", "resumen", "que dice", "que hay", "investiga", "busca", "summary"]
+    return any(k in t for k in keys)
+
+
+def _wants_web_search(s: str) -> bool:
+    t = _normalize_text(s)
+    keys = [
+        "sitios web", "paginas web", "websites", "links", "fuentes",
+        "dime", "recomienda", "donde puedo", "donde encontrar", "where can i find",
+    ]
+    # debe pedir sitios/links y no incluir URLs ya
+    return any(k in t for k in keys) and not bool(_extract_urls(s))
+
+
+# -------------------- Control de servicio Ollama (ON/OFF) --------------------
+
+def _is_macos() -> bool:
+    return platform.system() == "Darwin"
+
+
+def _exists(cmd: str) -> bool:
+    return shutil.which(cmd) is not None
+
+
+def _ollama_logs_dir() -> Path:
+    data_home = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share")))
+    piper_home = data_home / "piper-cli"
+    mkdirp(piper_home / "logs")
+    return piper_home / "logs"
+
+
+def start_ollama_service() -> tuple[bool, str]:
+    try:
+        if _is_macos():
+            if _exists("brew"):
+                proc = subprocess.run(["brew", "services", "start", "ollama"], capture_output=True, text=True)
+                ok = proc.returncode == 0
+                return ok, (proc.stdout or proc.stderr or "").strip()
+            # Fallback launchctl
+            plist = Path.home() / "Library" / "LaunchAgents" / "com.piper.ollama.plist"
+            if plist.exists():
+                proc = subprocess.run(["launchctl", "load", "-w", str(plist)], capture_output=True, text=True)
+                return proc.returncode == 0, (proc.stdout or proc.stderr or "").strip()
+            # Último recurso: proceso en background
+            log = _ollama_logs_dir() / "ollama.out.log"
+            cmd = f"nohup sh -c 'OLLAMA_HOST=127.0.0.1:11434 ollama serve >>\"{log}\" 2>&1' &"
+            os.system(cmd)
+            return True, "ollama serve lanzado en background (nohup)"
+        else:
+            # Linux
+            if _exists("systemctl"):
+                proc = subprocess.run(["systemctl", "--user", "start", "ollama.service"], capture_output=True, text=True)
+                if proc.returncode == 0:
+                    return True, "systemd user: ollama iniciado"
+            # Fallback: lanzar background
+            log = _ollama_logs_dir() / "ollama.log"
+            cmd = f"nohup sh -c 'OLLAMA_HOST=127.0.0.1:11434 ollama serve >>\"{log}\" 2>&1' &"
+            os.system(cmd)
+            return True, "ollama serve lanzado en background (nohup)"
+    except Exception as e:
+        return False, f"Error al iniciar Ollama: {e}"
+
+
+def stop_ollama_service() -> tuple[bool, str]:
+    try:
+        if _is_macos():
+            if _exists("brew"):
+                proc = subprocess.run(["brew", "services", "stop", "ollama"], capture_output=True, text=True)
+                # También matar remanentes
+                subprocess.run(["pkill", "-f", "ollama serve"], capture_output=True)
+                return proc.returncode == 0, (proc.stdout or proc.stderr or "").strip()
+            plist = Path.home() / "Library" / "LaunchAgents" / "com.piper.ollama.plist"
+            if plist.exists():
+                subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
+            subprocess.run(["pkill", "-f", "ollama serve"], capture_output=True)
+            return True, "ollama detenido"
+        else:
+            if _exists("systemctl"):
+                proc = subprocess.run(["systemctl", "--user", "stop", "ollama.service"], capture_output=True, text=True)
+                subprocess.run(["pkill", "-f", "ollama serve"], capture_output=True)
+                return proc.returncode == 0, (proc.stdout or proc.stderr or "").strip()
+            subprocess.run(["pkill", "-f", "ollama serve"], capture_output=True)
+            return True, "ollama detenido"
+    except Exception as e:
+        return False, f"Error al detener Ollama: {e}"
 
 
 # -------------------- Ollama integración opcional --------------------
@@ -247,6 +551,8 @@ def _sanitize_generated_content(text: str) -> str:
 def ollama_notes(prompt: str, stack: str, model: str) -> str:
     host = _ollama_host()
     user_prompt = (
+        "Contexto: Estás operando dentro de Piper CLI (herramienta local de terminal para convertir prompts en proyectos), "
+        "no es un producto de Amazon ni Alexa. No confundas ni menciones marcas ajenas, a menos que el usuario lo pida explícitamente.\n\n"
         "Eres un asistente técnico. Con base en el stack y la descripción del usuario, "
         "propón mejoras, pasos siguientes concretos y archivos adicionales sugeridos. "
         "Responde SOLO en Markdown usando los encabezados: \n\n"
@@ -435,10 +741,13 @@ def ollama_files(prompt: str, stack: str, model: str, *, max_files: int = 5, mod
     system = {
         "role": "system",
         "content": (
-            "Eres un asistente que genera archivos de inicio de un proyecto. "
+            "Contexto: Estás en Piper CLI (herramienta local de terminal para convertir prompts en proyectos). "
+            "No confundas ni menciones productos de Amazon/Alexa u otros proyectos llamados 'Piper' a menos que el usuario lo pida. "
+            "Tu salida DEBE ser estrictamente JSON y nada más. "
             "Devuelve SOLO un JSON válido con esta forma exacta, sin texto adicional: "
             "{\"files\":[{\"path\":\"rel/ruta\",\"content\":\"...\"}]} "
-            "Usa rutas relativas simples y contenido mínimo funcional CON CÓDIGO completo (sin placeholders como '...'). "
+            "Usa rutas relativas al proyecto, simples (p. ej. 'README.md', 'src/app.py'), nunca rutas de usuario como '~', '/home', '/Users' ni anidar bajo 'home/usuario'. "
+            "Incluye contenido mínimo funcional CON CÓDIGO completo (sin placeholders como '...'). "
             "Si el contenido proviene de notas con pasos/orden, respeta el orden sugerido en la lista 'files'."
         ),
     }
@@ -611,14 +920,14 @@ def _summarize_html(url: str, html: str, limit: int = 1200) -> str:
     return "\n".join(md)
 
 
-def research_urls(urls: List[str]) -> str:
+def research_urls(urls: List[str], *, timeout: float = 20.0) -> str:
     """Obtiene un resumen Markdown de múltiples URLs, evitando copiar código.
     Extrae título, meta descripción y encabezados/temas.
     """
     parts: list[str] = ["# Investigación", "\nNota: Este resumen evita incluir fragmentos de código. Solo recoge ideas, temas y referencias útiles."]
     for u in urls:
         try:
-            html = _fetch_url(u)
+            html = _fetch_url(u, timeout=timeout)
             if not html:
                 parts.append(f"\n## {u}\n(No HTML útil o tipo de contenido no soportado)")
                 continue
@@ -626,6 +935,145 @@ def research_urls(urls: List[str]) -> str:
         except Exception as e:
             parts.append(f"\n## {u}\nError al obtener: {e}")
     return "\n\n".join(parts).strip() + "\n"
+
+
+# -------------------- Búsqueda web (DuckDuckGo HTML) --------------------
+
+class _DDGParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self._in_result = False
+        self._urls: list[str] = []
+
+    def handle_starttag(self, tag, attrs):  # type: ignore[override]
+        if tag == "a":
+            attrs_d = dict(attrs)
+            href = attrs_d.get("href", "")
+            if not href:
+                return
+            # DuckDuckGo HTML usa redirecciones /l/?uddg=<URL>
+            if href.startswith("/l/?"):
+                try:
+                    qs = parse_qs(href.split("?", 1)[1])
+                    uddg = qs.get("uddg", [""])[0]
+                    if uddg:
+                        url = unquote(uddg)
+                        if url.startswith("http") and "duckduckgo.com" not in url:
+                            self._urls.append(url)
+                except Exception:
+                    return
+            elif href.startswith("http") and "duckduckgo.com" not in href:
+                self._urls.append(href)
+
+    def urls(self) -> list[str]:
+        # de-dup preservando orden
+        out: list[str] = []
+        seen: set[str] = set()
+        for u in self._urls:
+            if u not in seen:
+                out.append(u)
+                seen.add(u)
+        return out
+
+
+def search_web(query: str, max_results: int = 5, *, timeout: float = 15.0) -> list[str]:
+    """Búsqueda simple: intenta DuckDuckGo HTML y, si falla, Bing HTML.
+    Retorna lista de URLs. Sin API keys. Resiliente pero no garantizada.
+    """
+    q = quote_plus(query.strip())
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) PiperCLI/1.0",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+    }
+    urls: list[str] = []
+    for endpoint in (
+        f"https://html.duckduckgo.com/html/?q={q}",
+        f"https://duckduckgo.com/html/?q={q}",
+    ):
+        try:
+            req = urllib.request.Request(endpoint, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
+            parser = _DDGParser()
+            try:
+                parser.feed(html)
+            except Exception:
+                pass
+            urls = [u for u in parser.urls() if u.startswith("http") and not u.startswith("data:")]
+            if urls:
+                break
+        except Exception:
+            continue
+    # Fallback a Bing si no hay resultados
+    if not urls:
+        try:
+            bing = f"https://www.bing.com/search?q={q}&setlang=es"
+            req = urllib.request.Request(bing, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
+            # Extracción genérica de href con regex (simple y ruidosa)
+            hrefs = re.findall(r'href=\"(http[s]?://[^\"#]+)\"', html, flags=re.IGNORECASE)
+            # Filtrar dominios de Bing/Microsoft y duplicados
+            bad_hosts = ("bing.com", "microsoft.com", "go.microsoft", "msn.com")
+            clean: list[str] = []
+            seen: set[str] = set()
+            for h in hrefs:
+                host = urlparse(h).netloc.lower()
+                if any(b in host for b in bad_hosts):
+                    continue
+                if h not in seen:
+                    clean.append(h)
+                    seen.add(h)
+            urls = clean
+        except Exception:
+            urls = []
+    return urls[:max_results]
+
+
+def _extract_http_urls(text: str) -> list[str]:
+    if not text:
+        return []
+    found = re.findall(r"https?://[\w\-./?%&#=:+]+", text, flags=re.IGNORECASE)
+    out: list[str] = []
+    seen: set[str] = set()
+    for u in found:
+        if u not in seen:
+            out.append(u)
+            seen.add(u)
+    return out
+
+
+def llm_suggest_urls(query: str, model: str, *, count: int = 3) -> list[str]:
+    """Pide al modelo una lista de URLs (homepages) relevantes en JSON.
+    Fallback: extraer URLs de texto libre si el JSON no llega perfecto.
+    """
+    system = {
+        "role": "system",
+        "content": (
+            "Eres un asistente técnico. Devuelve SOLO JSON válido con esta forma exacta: "
+            "{\"urls\":[\"https://ejemplo.com\",\"https://otro.com\"]}. "
+            "Incluye de 3 a 5 URLs absolutas (https://) de sitios relevantes al pedido. Sin texto adicional."
+        ),
+    }
+    user = {"role": "user", "content": f"Pedido: {query}\n\nDevuelve solo JSON con urls."}
+    data = _ollama_chat_json([system, user], model)
+    urls: list[str] = []
+    if isinstance(data, dict) and isinstance(data.get("urls"), list):
+        for u in data.get("urls"):
+            if isinstance(u, str) and u.startswith("http"):
+                urls.append(u)
+    if not urls:
+        text = _ollama_chat([system, user], model)
+        urls = _extract_http_urls(text)
+    # de-dup y límite
+    out: list[str] = []
+    seen: set[str] = set()
+    for u in urls:
+        if u not in seen:
+            out.append(u)
+            seen.add(u)
+    return out[:max(1, int(count))]
 
 
 def _is_probably_binary(text: str) -> bool:
@@ -640,6 +1088,55 @@ def _is_probably_binary(text: str) -> bool:
     total = len(text)
     ctrl = sum(1 for ch in text if ord(ch) < 32 and ch not in ("\n", "\r", "\t"))
     return (ctrl / max(total, 1)) > 0.05
+
+
+# -------------------- Validación estricta de rutas IA --------------------
+
+_SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9._/\-]+$")
+
+
+def _validate_ai_relpath(base: Path, cand: str) -> tuple[bool, str, Path | None]:
+    """Valida una ruta propuesta por IA y la restringe al árbol de 'base'.
+    Reglas:
+    - No absoluta, no ~, no unidades tipo "C:".
+    - No segmentos "." ni ".." que salgan de la raíz.
+    - Sólo caracteres seguros [A-Za-z0-9._/\\-].
+    - Normaliza separadores y recorta espacios.
+    Devuelve (ok, motivo_o_rel_normalizada, path_absoluto_o_None)
+    """
+    if cand is None:
+        return False, "ruta vacía", None
+    s = str(cand).strip()
+    # normalizar separadores y eliminar backslashes (no soportamos rutas Windows)
+    s = s.replace("\\", "/")
+    # rutas absolutas no permitidas
+    if s.startswith("/"):
+        return False, "ruta absoluta no permitida", None
+    if not s:
+        return False, "ruta vacía", None
+    # prohibidos
+    if s.startswith("~"):
+        return False, "ruta con ~ no permitida", None
+    first_seg = s.split("/", 1)[0]
+    if ":" in first_seg:
+        return False, "ruta tipo unidad Windows no permitida", None
+    if "/./" in f"/{s}/" or "/../" in f"/{s}/" or s == "." or s.startswith("../"):
+        return False, "ruta con . o .. no permitida", None
+    # evitar patrones de carpetas tipo sistema al inicio (home, users, usuario, root)
+    if first_seg.lower() in {"home", "users", "user", "usuario", "root"}:
+        return False, "prefijo de sistema no permitido (p.ej. 'home/', 'Users/')", None
+    if not _SAFE_PATH_RE.match(s):
+        return False, "caracteres no permitidos en la ruta", None
+    # resolver y verificar dentro de base
+    base_abs = base.resolve()
+    target = (base_abs / s).resolve()
+    try:
+        _ = target.relative_to(base_abs)
+    except Exception:
+        return False, "ruta sale fuera del proyecto", None
+    # retornar forma relativa normalizada
+    rel_norm = str(target.relative_to(base_abs))
+    return True, rel_norm, target
 
 
 # -------------------- Plantillas --------------------
@@ -764,13 +1261,15 @@ def create_project(prompt: str, name: str | None, base_dir: Path) -> Tuple[Path,
 
 
 def cmd_project(args: argparse.Namespace) -> int:
+    progress_start("Preparando proyecto", 3)
     # Preguntar SIEMPRE por directorio destino, con default desde memoria o arg
     mem = get_config() or {}
     default_dir = args.dir or mem.get("project", {}).get("default_dir") or str(Path.cwd())
     try:
-        user_in = input(f"Directorio destino del proyecto [{default_dir}]: ").strip()
-    except EOFError:
-        user_in = ""
+        user_in = _ask_input(f"Directorio destino del proyecto [{default_dir}]: ")
+    except _UserCanceled:
+        print("[CANCELADO] Operación interrumpida por el usuario.")
+        return 130
     chosen_dir = Path(user_in or default_dir).expanduser().resolve()
     # Persistir preferencia última usada
     mem.setdefault("project", {})["default_dir"] = str(chosen_dir)
@@ -781,6 +1280,7 @@ def cmd_project(args: argparse.Namespace) -> int:
     base_dir = chosen_dir
     base_dir.mkdir(parents=True, exist_ok=True)
     dst, stack = create_project(args.prompt, args.name, base_dir)
+    progress_end()
     print(f"[OK] Proyecto creado: {dst}  (stack: {stack})")
     speak(os.environ.get("PIPER_ON_CREATE_MSG", "Proyecto creado"))
     # Investigación opcional por URL(s)
@@ -821,6 +1321,7 @@ def cmd_project(args: argparse.Namespace) -> int:
 
     if ai_enabled and model:
         try:
+            progress_start("Generando notas con IA", 15)
             prompt_for_ai = args.prompt
             if research_md:
                 prompt_for_ai = (
@@ -837,11 +1338,13 @@ def cmd_project(args: argparse.Namespace) -> int:
                         print("[OK] Investigación anexada a AI_NOTES.md")
                     except Exception as e:
                         print(f"[WARN] No se pudo anexar investigación a AI_NOTES.md: {e}")
+            progress_end()
         except Exception as e:
             print(f"[WARN] No se pudo generar AI_NOTES.md (modelo={model}): {e}")
         # Generar archivos por IA opcionalmente (iniciales)
         if ai_files_enabled:
             try:
+                progress_start("Generando archivos con IA", 20)
                 max_total = int(getattr(args, "max_ai_bytes", AI_TOTAL_BYTES_DEFAULT) or AI_TOTAL_BYTES_DEFAULT)
                 max_file = int(getattr(args, "max_ai_file_bytes", AI_FILE_BYTES_DEFAULT) or AI_FILE_BYTES_DEFAULT)
                 used = 0
@@ -854,49 +1357,52 @@ def cmd_project(args: argparse.Namespace) -> int:
                         print(f" - {f.get('path')}")
                     # Revisión por fichero con diff y confirmación (a menos que -y)
                     for f in files:
-                        rel = (f.get("path") or "").lstrip("/\\")
+                        rel_raw = f.get("path") or ""
                         content = _sanitize_generated_content(f.get("content") or "")
-                        target = (dst / rel).resolve()
-                        if not str(target).startswith(str(dst.resolve())):
-                            print(f"[SKIP] Ruta fuera del proyecto: {rel}")
+                        ok_path, rel_norm, target = _validate_ai_relpath(dst, rel_raw)
+                        if not ok_path or target is None:
+                            motivo = rel_norm or "inválida"
+                            print(f"[SKIP] Ruta inválida: {rel_raw} (razón: {motivo})")
                             continue
                         # Guardas: tamaño total y por archivo, y evitar binarios aparentes
                         content_bytes = content.encode("utf-8", errors="ignore")
                         size = len(content_bytes)
                         if size > max_file:
-                            print(f"[SKIP] {rel}: supera el máximo por archivo ({size} > {max_file} bytes)")
+                            print(f"[SKIP] {rel_norm}: supera el máximo por archivo ({size} > {max_file} bytes)")
                             continue
                         if used + size > max_total:
                             print(f"[STOP] Límite total de IA alcanzado ({used + size} > {max_total} bytes). Deteniendo escritura.")
                             break
                         if _is_probably_binary(content):
-                            print(f"[SKIP] {rel}: contenido parece binario o no textual")
+                            print(f"[SKIP] {rel_norm}: contenido parece binario o no textual")
                             continue
-                        old = ""
-                        if target.exists():
-                            try:
-                                old = target.read_text(encoding="utf-8")
-                            except Exception:
-                                old = ""
-                        if old != content:
-                            diff = difflib.unified_diff(
-                                old.splitlines(), content.splitlines(),
-                                fromfile=str(target), tofile=f"new:{rel}", lineterm=""
-                            )
-                            print("\n--- Diff:")
-                            for line in diff:
-                                print(line)
-                        else:
-                            print(f"[SAME] Sin cambios para {rel}")
+                        if getattr(args, "show_diff", False):
+                            old = ""
+                            if target.exists():
+                                try:
+                                    old = target.read_text(encoding="utf-8")
+                                except Exception:
+                                    old = ""
+                            if old != content:
+                                diff = difflib.unified_diff(
+                                    old.splitlines(), content.splitlines(),
+                                    fromfile=str(target), tofile=f"new:{rel_norm}", lineterm=""
+                                )
+                                print("\n--- Diff:")
+                                for line in diff:
+                                    print(line)
+                            else:
+                                print(f"[SAME] Sin cambios para {rel_norm}")
                         do_write = bool(getattr(args, "yes", False)) and not bool(getattr(args, "ask", False))
                         if not do_write:
-                            ans = input(f"¿Escribir {rel}? (y/N): ").strip().lower()
+                            ans = input(f"¿Escribir {rel_norm}? (y/N): ").strip().lower()
                             do_write = ans in ("y", "s", "yes", "si")
                         if do_write:
                             write_file(target, content)
                             used += size
-                            print(f"[OK] Escrito {rel}")
+                            print(f"[OK] Escrito {rel_norm}")
                     print("\n[OK] Revisión AI completada.")
+                progress_end()
             except Exception as e:
                 print(f"[WARN] No se pudieron generar archivos AI: {e}")
 
@@ -906,8 +1412,8 @@ def cmd_project(args: argparse.Namespace) -> int:
             proceed = auto_apply
             if not proceed:
                 try:
-                    apply_ans = input("¿Aplicar ahora las mejoras y pasos de AI_NOTES.md? (y/N): ").strip().lower()
-                except EOFError:
+                    apply_ans = _ask_input("¿Aplicar ahora las mejoras y pasos de AI_NOTES.md? (y/N): ").lower()
+                except _UserCanceled:
                     apply_ans = ""
                 proceed = apply_ans in ("y", "s", "yes", "si")
             if proceed:
@@ -918,6 +1424,7 @@ def cmd_project(args: argparse.Namespace) -> int:
                     text = ""
                 if text:
                     try:
+                        progress_start("Aplicando mejoras desde notas", 20)
                         plan = ollama_files(prompt=text, stack=stack, model=model, max_files=max_files, mode="notes")
                     except Exception as e:
                         print(f"[ERROR] No se pudo obtener archivos de IA desde notas: {e}")
@@ -930,11 +1437,12 @@ def cmd_project(args: argparse.Namespace) -> int:
                         for f in files2:
                             print(f" - {f.get('path')}")
                         for f in files2:
-                            rel = (f.get("path") or "").lstrip("/\\")
+                            rel_raw = f.get("path") or ""
                             content = _sanitize_generated_content(f.get("content") or "")
-                            target = (dst / rel).resolve()
-                            if not str(target).startswith(str(dst.resolve())):
-                                print(f"[SKIP] Ruta fuera del proyecto: {rel}")
+                            ok_path, rel_norm, target = _validate_ai_relpath(dst, rel_raw)
+                            if not ok_path or target is None:
+                                motivo = rel_norm or "inválida"
+                                print(f"[SKIP] Ruta inválida: {rel_raw} (razón: {motivo})")
                                 continue
                             # Guardas: tamaño y binario
                             max_total2 = int(getattr(args, "max_ai_bytes", AI_TOTAL_BYTES_DEFAULT) or AI_TOTAL_BYTES_DEFAULT)
@@ -947,44 +1455,51 @@ def cmd_project(args: argparse.Namespace) -> int:
                             content_bytes = content.encode("utf-8", errors="ignore")
                             size = len(content_bytes)
                             if size > max_file2:
-                                print(f"[SKIP] {rel}: supera el máximo por archivo ({size} > {max_file2} bytes)")
+                                print(f"[SKIP] {rel_norm}: supera el máximo por archivo ({size} > {max_file2} bytes)")
                                 continue
                             if used + size > max_total2:
                                 print(f"[STOP] Límite total de IA alcanzado ({used + size} > {max_total2} bytes). Deteniendo escritura.")
                                 break
                             if _is_probably_binary(content):
-                                print(f"[SKIP] {rel}: contenido parece binario o no textual")
+                                print(f"[SKIP] {rel_norm}: contenido parece binario o no textual")
                                 continue
-                            old = ""
-                            if target.exists():
-                                try:
-                                    old = target.read_text(encoding="utf-8")
-                                except Exception:
-                                    old = ""
-                            if old != content:
-                                diff = difflib.unified_diff(
-                                    old.splitlines(), content.splitlines(),
-                                    fromfile=str(target), tofile=f"new:{rel}", lineterm=""
-                                )
-                                print("\n--- Diff:")
-                                for line in diff:
-                                    print(line)
-                            else:
-                                print(f"[SAME] Sin cambios para {rel}")
+                            if getattr(args, "show_diff", False):
+                                old = ""
+                                if target.exists():
+                                    try:
+                                        old = target.read_text(encoding="utf-8")
+                                    except Exception:
+                                        old = ""
+                                if old != content:
+                                    diff = difflib.unified_diff(
+                                        old.splitlines(), content.splitlines(),
+                                        fromfile=str(target), tofile=f"new:{rel_norm}", lineterm=""
+                                    )
+                                    print("\n--- Diff:")
+                                    for line in diff:
+                                        print(line)
+                                else:
+                                    print(f"[SAME] Sin cambios para {rel_norm}")
                             # Respetar --ask si se pasó, si no, usar yes por defecto
                             do_write = bool(getattr(args, "yes", True)) and not bool(getattr(args, "ask", False))
                             if not do_write:
-                                ans = input(f"¿Escribir {rel}? (y/N): ").strip().lower()
+                                try:
+                                    ans = _ask_input(f"¿Escribir {rel_norm}? (y/N): ").lower()
+                                except _UserCanceled:
+                                    ans = ""
                                 do_write = ans in ("y", "s", "yes", "si")
                             if do_write:
                                 write_file(target, content)
                                 used += size
-                                print(f"[OK] Escrito {rel}")
+                                print(f"[OK] Escrito {rel_norm}")
                         print("\n[OK] Aplicación de notas completada.")
+                        progress_end()
     # Verificación rápida post-creación (lint/sintaxis y pruebas básicas si existen)
     try:
+        progress_start("Verificando proyecto", 5)
         _summary = verify_project(dst, stack)
         print(_summary)
+        progress_end()
     except Exception as e:
         print(f"[WARN] Verificación post-creación falló: {e}")
     # Smoke run: por defecto en stack 'python' simple, o si --smoke-run está presente; desactivable con --no-smoke-run
@@ -994,10 +1509,36 @@ def cmd_project(args: argparse.Namespace) -> int:
     do_smoke = bool(getattr(args, "smoke_run", False)) or (stack == "python" and bool(smoke_default_python) and not bool(getattr(args, "no_smoke_run", False)))
     if do_smoke:
         try:
+            progress_start("Prueba rápida (smoke run)", 5)
             ok, msg = smoke_run(dst, stack, timeout=int(getattr(args, "smoke_timeout", 5) or 5))
             print(msg)
+            progress_end()
         except Exception as e:
             print(f"[WARN] Smoke run falló: {e}")
+    # Resumen con mayordomo y árbol de proyecto
+    try:
+        summary_lines = [
+            f"Listo, se completó la creación del proyecto: {dst.name}",
+            "Estructura principal:",
+        ]
+        for ln in _dir_tree(dst, max_depth=2, max_entries=80):
+            summary_lines.append(ln)
+        print("\n" + _ascii_butler(summary_lines) + "\n")
+    except Exception:
+        pass
+    # Ofrecer nueva interacción
+    try:
+        ans = input("¿Gusta agregar o hacer otra opción? (y/N): ").strip().lower()
+    except EOFError:
+        ans = ""
+    if ans in ("y", "s", "yes", "si"):
+        try:
+            nxt = input("Escribe tu prompt (o ENTER para salir): ").strip()
+        except EOFError:
+            nxt = ""
+        if nxt:
+            ns = argparse.Namespace(prompt=nxt, model=None, no_tts=False)
+            return cmd_assist(ns)
     return 0
 
 
@@ -1005,36 +1546,253 @@ def cmd_assist(args: argparse.Namespace) -> int:
     # --fast fuerza un modelo ligero por ejecución
     if getattr(args, "fast", False):
         args.model = "phi3:mini"
+    # Intento local: si el prompt pide la fecha de hoy, responder sin IA
+    prompt0 = getattr(args, "prompt", "")
+    if _is_date_query(prompt0):
+        text = _date_today_text()
+        print(text)
+        if not args.no_tts:
+            speak(text)
+        _maybe_save_output(Path.cwd(), getattr(args, "save", None), text, append=bool(getattr(args, "append", False)))
+        return 0
+    # Intento local: hora actual
+    if _is_time_query(prompt0):
+        text = _time_now_text()
+        print(text)
+        if not args.no_tts:
+            speak(text)
+        _maybe_save_output(Path.cwd(), getattr(args, "save", None), text, append=bool(getattr(args, "append", False)))
+        return 0
+    # Intento local: directorio actual
+    if _is_cwd_query(prompt0):
+        text = _cwd_text()
+        print(text)
+        if not args.no_tts:
+            speak(text)
+        _maybe_save_output(Path.cwd(), getattr(args, "save", None), text, append=bool(getattr(args, "append", False)))
+        return 0
+    # Web + LLM: si --web está activo, usar investigación + modelo para responder al prompt (tiene prioridad)
+    if getattr(args, "web", False):
+        urls = _extract_urls(prompt0)
+        # Si no hay URLs explícitas, intentamos buscarlas a partir del prompt
+        if not urls:
+            web_max = int(getattr(args, "web_max", 5) or 5)
+            web_timeout = float(getattr(args, "web_timeout", 15) or 15)
+            urls = with_progress("Buscando sitios en la web", 6, search_web, prompt0, max_results=web_max, timeout=web_timeout)
+            if not urls:
+                # Último recurso: pedir al modelo que sugiera URLs
+                model0 = _ensure_model_available(_resolve_model(args.model))
+                urls = with_progress("Sugerencias de sitios (modelo)", 8, llm_suggest_urls, prompt0, model0, count=web_max)
+                if not urls:
+                    print("[ERROR] No se encontraron URLs para la búsqueda web a partir del prompt")
+                    return 2
+        try:
+            web_max = int(getattr(args, "web_max", 5) or 5)
+            web_timeout = float(getattr(args, "web_timeout", 15) or 15)
+            est = min(5 * len(urls[:web_max]), 25)
+            md = with_progress("Investigación web (resumen)", est, research_urls, urls[:web_max], timeout=web_timeout)
+        except Exception as e:
+            print(f"[ERROR] Investigación web falló: {e}")
+            return 1
+        model = _ensure_model_available(_resolve_model(args.model))
+        system = {
+            "role": "system",
+            "content": (
+                "Eres un asistente técnico en Piper CLI. Usa el CONTEXTO a continuación (resumen web) como referencia; "
+                "no copies código textual de las páginas. Responde claro, en Markdown si corresponde."
+            ),
+        }
+        user_msg = {
+            "role": "user",
+            "content": (
+                f"Solicitud: {prompt0}\n\nCONTEXTO (resumen web, sin código copiado):\n{md}\n\n"
+                "Responde usando el contexto, citando ideas o temas relevantes, sin pegar código de las páginas."
+            ),
+        }
+        gen_est = int(getattr(args, "gen_estimate", 20) or 20)
+        out_text = with_progress("Generando respuesta (modelo)", gen_est, _ollama_chat, [system, user_msg], model)
+        print(out_text)
+        if not args.no_tts and out_text:
+            speak(out_text)
+        _maybe_save_output(Path.cwd(), getattr(args, "save", None), out_text, append=bool(getattr(args, "append", False)))
+        return 0
+    # Auto-búsqueda web si la intención lo sugiere (sin requerir --web)
+    if _wants_web_search(prompt0):
+        print("[INFO] Usando búsqueda web para responder...")
+        web_max = int(getattr(args, "web_max", 5) or 5)
+        web_timeout = float(getattr(args, "web_timeout", 15) or 15)
+        urls = with_progress("Buscando sitios en la web", 6, search_web, prompt0, max_results=web_max, timeout=web_timeout)
+        if not urls:
+            model0 = _ensure_model_available(_resolve_model(args.model))
+            urls = with_progress("Sugerencias de sitios (modelo)", 8, llm_suggest_urls, prompt0, model0, count=web_max)
+        if urls:
+            try:
+                est2 = min(5 * len(urls[:web_max]), 25)
+                md = with_progress("Investigación web (resumen)", est2, research_urls, urls[:web_max], timeout=web_timeout)
+            except Exception as e:
+                print(f"[ERROR] Investigación web falló: {e}")
+                md = ""
+            model0 = _ensure_model_available(_resolve_model(args.model))
+            system = {
+                "role": "system",
+                "content": (
+                    "Eres un asistente técnico en Piper CLI. Usa el CONTEXTO (resumen web) como referencia; "
+                    "no copies código textual. Responde claro y práctico."
+                ),
+            }
+            user_msg = {"role": "user", "content": f"Solicitud: {prompt0}\n\nCONTEXTO:\n{md}"}
+            gen_est = int(getattr(args, "gen_estimate", 20) or 20)
+            out_text = with_progress("Generando respuesta (modelo)", gen_est, _ollama_chat, [system, user_msg], model0)
+            print(out_text)
+            if not args.no_tts and out_text:
+                speak(out_text)
+            _maybe_save_output(Path.cwd(), getattr(args, "save", None), out_text, append=bool(getattr(args, "append", False)))
+            return 0
+    # Intento local: si el prompt contiene URL(s) y pide resumen web
+    urls0 = _extract_urls(prompt0)
+    if urls0 and _wants_web_summary(prompt0):
+        try:
+            web_timeout = float(getattr(args, "web_timeout", 15) or 15)
+            est0 = min(5 * len(urls0[:3]), 15)
+            md = with_progress("Investigación web (resumen)", est0, research_urls, urls0[:3], timeout=web_timeout)
+            print(md)
+            _maybe_save_output(Path.cwd(), getattr(args, "save", None), md, append=bool(getattr(args, "append", False)))
+            return 0
+        except Exception as e:
+            print(f"[ERROR] No se pudo obtener resumen web: {e}")
+    # Modo libre tipo chat: respuesta de texto del modelo directamente
+    if getattr(args, "freeform", False):
+        model = _ensure_model_available(_resolve_model(args.model))
+        system = {
+            "role": "system",
+            "content": (
+                "Eres un asistente técnico integrado en Piper CLI (local). "
+                "Responde de manera clara y útil. Si el usuario pide crear contenido, redacta en Markdown. "
+                "No confundas Piper CLI con productos de Amazon/Alexa u otros 'Piper'."
+            ),
+        }
+        messages: List[Dict[str, Any]] = [system, {"role": "user", "content": prompt0}]
+        gen_est = int(getattr(args, "gen_estimate", 20) or 20)
+        out_text = with_progress("Generando respuesta (modelo)", gen_est, _ollama_chat, messages, model)
+        print(out_text)
+        if not args.no_tts and out_text:
+            speak(out_text)
+        _maybe_save_output(Path.cwd(), getattr(args, "save", None), out_text, append=bool(getattr(args, "append", False)))
+        return 0
     model = _ensure_model_available(_resolve_model(args.model))
     system = {
         "role": "system",
         "content": (
-            "Eres un asistente que ayuda a clarificar peticiones ambiguas. "
-            "Si la petición requiere más detalles, formula UNA pregunta específica y útil. "
+            "Contexto: Estás integrado en Piper CLI, una herramienta local de terminal que ayuda a convertir prompts en proyectos y tareas, "
+            "con integración a Ollama y TTS opcional. NO confundas Piper CLI con productos de Amazon, Alexa u otros proyectos llamados 'Piper'. "
+            "Si el usuario menciona 'Piper' sin más, asume que se refiere a Piper CLI local de este equipo. "
+            "Si percibes ambigüedad entre distintas marcas/tecnologías llamadas igual, pregunta para aclarar antes de afirmar. "
+            "Tu objetivo es ayudar a clarificar peticiones ambiguas; si la petición requiere más detalles, formula UNA pregunta específica y útil. "
             "Si ya hay suficiente contexto, responde claramente. "
             "Responde SIEMPRE en este formato JSON, sin texto adicional: "
             "{\"type\":\"question\",\"text\":\"...\"} o {\"type\":\"answer\",\"text\":\"...\"}."
         ),
     }
-    messages: List[Dict[str, Any]] = [system, {"role": "user", "content": args.prompt}]
+    user_content = (
+        "Nos referimos a 'Piper CLI' (este proyecto local), NO a productos de Amazon ni Alexa. "
+        "Si la petición es ambigua, pregunta primero. "
+        f"Petición: {args.prompt}"
+    )
+    messages: List[Dict[str, Any]] = [system, {"role": "user", "content": user_content}]
     while True:
-        out = _ollama_chat(messages, model)
-        # Intentar parsear JSON
-        try:
-            data = json.loads(out)
-        except Exception:
-            print(out)
-            if not args.no_tts:
-                speak(out)
-            return 0
+        data = _ollama_chat_json(messages, model)
+        # data debería ser {type:"question"|"answer", text:"..."}
+        if not isinstance(data, dict) or not data:
+            # Fallback: texto simple
+            out_text = _ollama_chat(messages, model)
+            # Guardarraíl mínimo contra confusión Amazon
+            low = (out_text or "").lower()
+            if "amazon" in low and "piper" in low:
+                data = {"type": "question", "text": "¿Te refieres a Piper CLI (esta herramienta local) o a otro producto llamado Piper?"}
+            else:
+                print(out_text)
+                if not args.no_tts:
+                    speak(out_text)
+                return 0
         t = (data or {}).get("type")
         text = (data or {}).get("text") or ""
+        # Segundo guardarraíl: si el texto confunde con Amazon, pedir aclaración
+        lowt = text.lower()
+        if "amazon" in lowt and "piper" in lowt:
+            t = "question"
+            text = "¿Te refieres a Piper CLI (esta herramienta local) o a otro producto llamado Piper?"
         if t == "question":
+            # Si la propia pregunta del modelo es sobre la fecha de hoy, responde localmente
+            if _is_date_query(text):
+                ans = _date_today_text()
+                print(ans)
+                if not args.no_tts:
+                    speak(ans)
+                _maybe_save_output(Path.cwd(), getattr(args, "save", None), ans, append=bool(getattr(args, "append", False)))
+                return 0
+            # Si pregunta la hora
+            if _is_time_query(text):
+                ans = _time_now_text()
+                print(ans)
+                if not args.no_tts:
+                    speak(ans)
+                _maybe_save_output(Path.cwd(), getattr(args, "save", None), ans, append=bool(getattr(args, "append", False)))
+                return 0
+            # Si pregunta directorio actual
+            if _is_cwd_query(text):
+                ans = _cwd_text()
+                print(ans)
+                if not args.no_tts:
+                    speak(ans)
+                _maybe_save_output(Path.cwd(), getattr(args, "save", None), ans, append=bool(getattr(args, "append", False)))
+                return 0
+            # Si la pregunta trae URL(s) y parece pedir resumen
+            urls_q = _extract_urls(text)
+            if urls_q and _wants_web_summary(text):
+                try:
+                    md = research_urls(urls_q[:3])
+                    print(md)
+                    _maybe_save_output(Path.cwd(), getattr(args, "save", None), md, append=bool(getattr(args, "append", False)))
+                    return 0
+                except Exception as e:
+                    print(f"[ERROR] No se pudo obtener resumen web: {e}")
             print(text)
             try:
-                answer = input("> ").strip()
-            except EOFError:
+                answer = _ask_input("> ")
+            except _UserCanceled:
+                print("[CANCELADO] Operación interrumpida por el usuario.")
+                return 130
+            # Si el usuario responde preguntando por la fecha, resolver localmente
+            if _is_date_query(answer):
+                ans = _date_today_text()
+                print(ans)
+                if not args.no_tts:
+                    speak(ans)
+                _maybe_save_output(Path.cwd(), getattr(args, "save", None), ans, append=bool(getattr(args, "append", False)))
                 return 0
+            if _is_time_query(answer):
+                ans = _time_now_text()
+                print(ans)
+                if not args.no_tts:
+                    speak(ans)
+                _maybe_save_output(Path.cwd(), getattr(args, "save", None), ans, append=bool(getattr(args, "append", False)))
+                return 0
+            if _is_cwd_query(answer):
+                ans = _cwd_text()
+                print(ans)
+                if not args.no_tts:
+                    speak(ans)
+                _maybe_save_output(Path.cwd(), getattr(args, "save", None), ans, append=bool(getattr(args, "append", False)))
+                return 0
+            urls_a = _extract_urls(answer)
+            if urls_a and _wants_web_summary(answer):
+                try:
+                    md = research_urls(urls_a[:3])
+                    print(md)
+                    _maybe_save_output(Path.cwd(), getattr(args, "save", None), md, append=bool(getattr(args, "append", False)))
+                    return 0
+                except Exception as e:
+                    print(f"[ERROR] No se pudo obtener resumen web: {e}")
             messages.append({"role": "assistant", "content": text})
             messages.append({"role": "user", "content": answer})
             continue
@@ -1042,15 +1800,38 @@ def cmd_assist(args: argparse.Namespace) -> int:
             print(text)
             if not args.no_tts:
                 speak(text)
+            _maybe_save_output(Path.cwd(), getattr(args, "save", None), text, append=bool(getattr(args, "append", False)))
             return 0
         else:
-            print(out)
+            print(text)
+            if not args.no_tts and text:
+                speak(text)
+            _maybe_save_output(Path.cwd(), getattr(args, "save", None), text, append=bool(getattr(args, "append", False)))
             return 0
 
 
 def cmd_say(args: argparse.Namespace) -> int:
     said = speak(args.text)
     return 0 if said else 1
+
+
+def cmd_service_on(_args: argparse.Namespace) -> int:
+    ok, msg = start_ollama_service()
+    print(msg or ("[OK] Ollama iniciado" if ok else "[ERROR] No se pudo iniciar Ollama"))
+    # Intento de ping rápido
+    try:
+        tags = _get_json(f"{_ollama_host()}/api/tags")
+        if isinstance(tags, dict):
+            print("[OK] Ollama responde en", _ollama_host())
+    except Exception:
+        print("[WARN] No se pudo verificar Ollama vía HTTP ahora mismo")
+    return 0 if ok else 1
+
+
+def cmd_service_off(_args: argparse.Namespace) -> int:
+    ok, msg = stop_ollama_service()
+    print(msg or ("[OK] Ollama detenido" if ok else "[ERROR] No se pudo detener Ollama"))
+    return 0 if ok else 1
 
 
 def cmd_apply_notes(args: argparse.Namespace) -> int:
@@ -1083,11 +1864,12 @@ def cmd_apply_notes(args: argparse.Namespace) -> int:
     for f in files:
         print(f" - {f.get('path')}")
     for f in files:
-        rel = (f.get("path") or "").lstrip("/\\")
+        rel_raw = f.get("path") or ""
         content = _sanitize_generated_content(f.get("content") or "")
-        target = (proj_dir / rel).resolve()
-        if not str(target).startswith(str(proj_dir.resolve())):
-            print(f"[SKIP] Ruta fuera del proyecto: {rel}")
+        ok_path, rel_norm, target = _validate_ai_relpath(proj_dir, rel_raw)
+        if not ok_path or target is None:
+            motivo = rel_norm or "inválida"
+            print(f"[SKIP] Ruta inválida: {rel_raw} (razón: {motivo})")
             continue
         old = ""
         if target.exists():
@@ -1098,20 +1880,23 @@ def cmd_apply_notes(args: argparse.Namespace) -> int:
         if old != content:
             diff = difflib.unified_diff(
                 old.splitlines(), content.splitlines(),
-                fromfile=str(target), tofile=f"new:{rel}", lineterm=""
+                fromfile=str(target), tofile=f"new:{rel_norm}", lineterm=""
             )
             print("\n--- Diff:")
             for line in diff:
                 print(line)
         else:
-            print(f"[SAME] Sin cambios para {rel}")
+            print(f"[SAME] Sin cambios para {rel_norm}")
         do_write = getattr(args, "yes", False)
         if not do_write:
-            ans = input(f"¿Escribir {rel}? (y/N): ").strip().lower()
+            try:
+                ans = _ask_input(f"¿Escribir {rel_norm}? (y/N): ").lower()
+            except _UserCanceled:
+                ans = ""
             do_write = ans in ("y", "s", "yes", "si")
         if do_write:
             write_file(target, content)
-            print(f"[OK] Escrito {rel}")
+            print(f"[OK] Escrito {rel_norm}")
     print("\n[OK] Aplicación de notas completa.")
     return 0
 
@@ -1378,6 +2163,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_assist.add_argument("--model", help="Modelo Ollama (por defecto PIPER_OLLAMA_MODEL o mistral:7b-instruct)")
     p_assist.add_argument("--fast", action="store_true", help="Usar modelo rápido (phi3:mini) en esta ejecución")
     p_assist.add_argument("--no-tts", action="store_true", help="Desactiva TTS al responder")
+    p_assist.add_argument("--freeform", action="store_true", help="Modo estilo chat: respuesta libre de texto (sin JSON)")
+    p_assist.add_argument("--web", action="store_true", help="Usa resumen web de URLs del prompt como contexto para la respuesta")
+    p_assist.add_argument("--web-max", type=int, default=5, help="Máximo de sitios web a considerar (por defecto 5)")
+    p_assist.add_argument("--web-timeout", type=int, default=15, help="Timeout por solicitud web en segundos (por defecto 15s)")
+    p_assist.add_argument("--gen-estimate", type=int, default=20, help="Tiempo estimado (s) mostrado para la fase de generación")
+    p_assist.add_argument("--save", help="Guardar la salida en un archivo relativo (p. ej. 'notas.md')")
+    p_assist.add_argument("--append", action="store_true", help="Anexar en vez de sobrescribir al usar --save")
     p_assist.set_defaults(func=cmd_assist)
 
     p_project = sub.add_parser("project", help="Genera un proyecto")
@@ -1402,6 +2194,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_project.add_argument("--no-smoke-run", action="store_true", help="Desactiva el smoke run por defecto en stack 'python'")
     p_project.add_argument("--max-ai-bytes", type=int, default=AI_TOTAL_BYTES_DEFAULT, help=f"Máximo de bytes a escribir por IA en un lote (por defecto {AI_TOTAL_BYTES_DEFAULT} bytes ~ {AI_TOTAL_BYTES_DEFAULT//(1024*1024)}MB)")
     p_project.add_argument("--max-ai-file-bytes", type=int, default=AI_FILE_BYTES_DEFAULT, help=f"Máximo de bytes por archivo IA (por defecto {AI_FILE_BYTES_DEFAULT} bytes ~ {AI_FILE_BYTES_DEFAULT//(1024*1024)}MB)")
+    p_project.add_argument("--show-diff", action="store_true", help="Mostrar diff al aplicar archivos IA (por defecto oculto)")
     # Por defecto: AI activado, archivos IA activados, escritura sin preguntar y aplicar notas automáticamente; sin límite de archivos
     p_project.set_defaults(func=cmd_project, ai=True, ai_files=True, yes=True, auto_apply_notes=True, max_files=0)
 
@@ -1409,12 +2202,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_say.add_argument("text")
     p_say.set_defaults(func=cmd_say)
 
+    # Servicio Ollama ON/OFF (acepta mayúsculas y minúsculas)
+    p_on = sub.add_parser("on", help="Enciende el servicio Ollama")
+    p_on.set_defaults(func=cmd_service_on)
+    p_on2 = sub.add_parser("ON", help="Enciende el servicio Ollama")
+    p_on2.set_defaults(func=cmd_service_on)
+    p_off = sub.add_parser("off", help="Apaga el servicio Ollama")
+    p_off.set_defaults(func=cmd_service_off)
+    p_off2 = sub.add_parser("OFF", help="Apaga el servicio Ollama")
+    p_off2.set_defaults(func=cmd_service_off)
+
     # Aplicar propuestas desde AI_NOTES.md al proyecto
     p_apply = sub.add_parser("apply-notes", help="Genera y aplica archivos desde AI_NOTES.md con revisión")
     p_apply.add_argument("--dir", default=str(Path.cwd()), help="Directorio del proyecto (por defecto: cwd)")
     p_apply.add_argument("--model", help="Modelo Ollama (por defecto PIPER_OLLAMA_MODEL o mistral:7b-instruct)")
     p_apply.add_argument("--fast", action="store_true", help="Usar modelo rápido (phi3:mini) en esta ejecución")
     p_apply.add_argument("-y", "--yes", action="store_true", help="Escribir sin preguntar por fichero")
+    p_apply.add_argument("--show-diff", action="store_true", help="Mostrar diff al aplicar archivos IA (por defecto oculto)")
     p_apply.set_defaults(func=cmd_apply_notes)
 
     # Revisar/Arreglar proyecto
@@ -1440,21 +2244,41 @@ def build_parser() -> argparse.ArgumentParser:
     p_conf.add_argument("--disable-smoke-python", action="store_true", help="Desactiva smoke run por defecto en stack 'python'")
     p_conf.set_defaults(func=cmd_config)
 
-    # Comando por defecto: project
+    # Positional opcional sólo si no hay subcomando
     p.add_argument("default_prompt", nargs="?", help=argparse.SUPPRESS)
     return p
 
 
 def main(argv: list[str]) -> int:
+    # Banner global al inicio, desactivable con PIPER_NO_BANNER=1
+    if os.environ.get("PIPER_NO_BANNER", "0") not in ("1", "true", "yes"): 
+        try:
+            print(_ascii_banner())
+        except Exception:
+            pass
     parser = build_parser()
-    args = parser.parse_args(argv[1:])
+    # Permitir modo "piper \"haz X\"" sin subcomando, tolerando flags desconocidas
+    args, extras = parser.parse_known_args(argv[1:])
     if not getattr(args, "cmd", None):
-        # Sin subcomando explícito -> asistente (para uso rápido tipo: piper "haz X")
-        default_prompt = args.default_prompt or (argv[1] if len(argv) > 1 else None)
+        # Sin subcomando explícito -> asistente rápido
+        default_prompt = getattr(args, "default_prompt", None) or (extras[0] if extras else (argv[1] if len(argv) > 1 else None))
         if not default_prompt:
             parser.print_help(sys.stderr)
             return 2
-        ns = argparse.Namespace(prompt=default_prompt, model=None, no_tts=False)
+        # Detectar bandera --no-tts en extras si se pasó en modo rápido
+        no_tts = any(x == "--no-tts" for x in extras)
+        ns = argparse.Namespace(
+            prompt=default_prompt,
+            model=None,
+            no_tts=no_tts,
+            web=False,
+            freeform=False,
+            web_max=5,
+            web_timeout=15,
+            gen_estimate=20,
+            save=None,
+            append=False,
+        )
         return cmd_assist(ns)
     return args.func(args)
 

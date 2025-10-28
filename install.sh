@@ -80,9 +80,35 @@ run "cp -r '$SRC_DIR/src/'* '$PIPER_HOME/src/'"
 if [[ -f "$SRC_DIR/bin/piper" ]]; then
   run "install -m 0755 '$SRC_DIR/bin/piper' '$PIPER_WRAPPER'"
 else
-  # wrapper simple por si faltara el archivo
-  run "bash -c 'cat >\''$PIPER_WRAPPER'\'' <<\"WRAP\"\n#!/usr/bin/env bash\nset -euo pipefail\nPY=\${PYTHON:-python3}\nPIPER_HOME=\"\${PIPER_HOME:-\${XDG_DATA_HOME:-$HOME/.local/share}/piper-cli}\"\nSRC_DIR=\"$PIPER_HOME/src\"\nAPP_PATH=\"$PIPER_HOME/src/piper_cli.py\"\nexport PYTHONPATH=\"$SRC_DIR\${PYTHONPATH:+:$PYTHONPATH}\"\nexec \"$PY\" \"$APP_PATH\" \"$@\"\nWRAP\n'"
-  run "chmod +x '$PIPER_WRAPPER'"
+  # wrapper simple por si faltara el archivo (heredoc sin expansión)
+  if [[ "$DRY_RUN" = 1 ]]; then
+    say "+ Crear wrapper en $PIPER_WRAPPER"
+  else
+    cat >"$PIPER_WRAPPER" <<'WRAP'
+#!/usr/bin/env bash
+set -euo pipefail
+PY=${PYTHON:-python3}
+PIPER_HOME="${PIPER_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/piper-cli}"
+SRC_DIR="$PIPER_HOME/src"
+APP_PATH="$PIPER_HOME/src/piper_cli.py"
+export PYTHONPATH="$SRC_DIR${PYTHONPATH:+:$PYTHONPATH}"
+
+# Si el primer argumento no es un subcomando conocido, redirigir a 'assist'
+if [[ $# -gt 0 ]]; then
+  case "$1" in
+    assist|project|say|on|ON|off|OFF|apply-notes|fix|research|config)
+      ;; # comando conocido
+    -*)
+      ;; # flags al tope, deja que Python lo maneje
+    *)
+      exec "$PY" "$APP_PATH" assist "$@"
+      ;;
+  esac
+fi
+exec "$PY" "$APP_PATH" "$@"
+WRAP
+    chmod +x "$PIPER_WRAPPER"
+  fi
 fi
 
 # Asegurar que ~/.local/bin esté en PATH

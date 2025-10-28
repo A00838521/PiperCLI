@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Mínimo backend TTS para Piper en Linux.
-Preferencias:
-- spd-say (Speech Dispatcher)
-- espeak-ng
-- espeak
+Mínimo backend TTS para Piper.
+Preferencias por plataforma:
+- macOS: `say`
+- Linux: `spd-say` (Speech Dispatcher), `espeak-ng`, `espeak`
 Si no hay TTS disponible, retorna False sin lanzar excepciones.
 """
 from __future__ import annotations
+import platform
 import shutil
 import subprocess
 import sys
@@ -28,6 +28,14 @@ def speak(text: str, lang: str = "es") -> bool:
     text = text.strip().replace("\n", " ")
     if len(text) > 300:
         text = text[:297] + "..."
+
+    # 0) macOS: usar 'say' si está disponible
+    try:
+        if platform.system() == "Darwin" and shutil.which("say"):
+            # Mapear lenguaje a voz básica si se desea en el futuro; por ahora solo pasamos el texto
+            return _run(["say", text])
+    except Exception:
+        pass
 
     # 1) spd-say (Speech Dispatcher)
     if shutil.which("spd-say"):
