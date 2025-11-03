@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-Piper CLI — primer MVP estilo Copilot: de prompt a proyecto.
+Piper CLI — asistente estilo Copilot para terminal local.
 
 Comandos:
-    project       Crea un proyecto mínimo a partir de un prompt (por defecto)
-    assist        Asistente interactivo
+    assist        Asistente interactivo (respuestas concisas; web opcional)
+    agent         Planifica y ejecuta comandos (con asistencia y streaming)
     apply-notes   Aplica archivos sugeridos desde AI_NOTES.md
     fix           Revisa sintaxis y prueba proyectos (inicialmente Python)
     say           Reproduce TTS con Piper (si está disponible)
 
 Ejemplos:
-    python3 tools/piper_cli.py "Flask hello world con Docker"
-    python3 tools/piper_cli.py project --name hola-fastapi "API FastAPI con /salud"
-    python3 tools/piper_cli.py say "Listo, proyecto creado"
+    piper assist "Explica brevemente qué hace Piper"
+    piper assist "Compara librerías de scraping" --web
+    piper agent  "Inicializa un proyecto con Vite y React"
 """
 from __future__ import annotations
 import argparse
@@ -556,10 +556,223 @@ def _os_info_text() -> str:
         return "No pude obtener la información del sistema."
 
 
+# -------------------- Intents locales (estado del sistema, carpeta, servicios) --------------------
+
+def _is_system_status_query(s: str) -> bool:
+    t = _normalize_text(s)
+    keys = [
+        "estado del sistema", "estatus del sistema", "estatus actual", "estado actual",
+        "uso de cpu", "uso de memoria", "memoria disponible", "espacio en disco",
+        "temperatura", "bateria", "batería", "uptime", "tiempo encendido",
+    ]
+    return any(k in t for k in keys)
+
+
+def _run_cmd_capture(cmd: list[str], timeout: float = 3.0) -> str:
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return (proc.stdout or proc.stderr or "").strip()
+    except Exception:
+        return ""
+
+
+def _system_status_text() -> str:
+    # CPU load
+    try:
+        la1, la5, la15 = os.getloadavg()
+        load_txt = f"loadavg: {la1:.2f}/{la5:.2f}/{la15:.2f}"
+    except Exception:
+        load_txt = "loadavg: n/a"
+    # Memoria (macOS: vm_stat)
+    mem_txt = "mem: n/a"
+    try:
+        if platform.system() == "Darwin":
+            out = _run_cmd_capture(["vm_stat"])  # páginas de 4096 bytes
+            m = re.findall(r"(\w+):\s+(\d+)\.", out)
+            stats = {k: int(v) for k, v in m}
+            page = 4096
+            free = (stats.get("Pages free", 0) + stats.get("Pages speculative", 0)) * page
+            active = stats.get("Pages active", 0) * page
+            wired = stats.get("Pages wired down", 0) * page
+            # Total aproximado
+            total_str = _run_cmd_capture(["sysctl", "-n", "hw.memsize"]) or "0"
+            total = int(total_str.strip() or "0")
+            mem_txt = f"mem: total={total//(1024**3)}GB, libre={(free)//(1024**2)}MB, activa={active//(1024**2)}MB, cableada={wired//(1024**2)}MB"
+    except Exception:
+        pass
+    # Disco
+    try:
+        du = shutil.disk_usage("/")
+        disk_txt = f"disk: usado={du.used//(1024**3)}GB/{du.total//(1024**3)}GB"
+    except Exception:
+        disk_txt = "disk: n/a"
+    # Uptime
+    up_txt = _run_cmd_capture(["uptime", "-p"]) or "uptime: n/a"
+    # Batería (macOS pmset)
+    bat_txt = _run_cmd_capture(["pmset", "-g", "batt"]) if platform.system() == "Darwin" else ""
+    if bat_txt:
+        # compáctalo
+        bat_txt = "bat: " + bat_txt.splitlines()[-1]
+    # Temperatura (istats, si existe)
+    temp_txt = ""
+    if shutil.which("istats"):
+        t = _run_cmd_capture(["istats", "--value-only", "CPU temp"]) or ""
+        temp_txt = f"temp: {t.strip()}" if t else ""
+    parts = [p for p in [load_txt, mem_txt, disk_txt, up_txt, bat_txt, temp_txt] if p]
+    return " | ".join(parts)
+
+
+def _is_create_folder_query(s: str) -> bool:
+    t = _normalize_text(s)
+    keys = ["crear carpeta", "nueva carpeta", "make folder", "create folder"]
+    return any(k in t for k in keys)
+
+
+def _extract_folder_name(s: str) -> str | None:
+    m = re.search(r"['\"]([^'\"]{1,80})['\"]", s)
+    if m:
+        return m.group(1).strip()
+    m2 = re.search(r"carpeta\s+([\w ._-]{1,80})", _normalize_text(s))
+    if m2:
+        return m2.group(1).strip()
+    return None
+
+
+def _create_folder_in_downloads(name: str) -> tuple[bool, str]:
+    safe = re.sub(r"[^A-Za-z0-9._ \-]", "_", name).strip()
+    if not safe:
+        return False, "Nombre de carpeta inválido."
+    # Evitar subrutas
+    if "/" in safe or ".." in safe:
+        return False, "Nombre de carpeta no debe contener rutas."
+    dst = Path.home() / "Downloads" / safe
+    try:
+        dst.mkdir(parents=True, exist_ok=True)
+        return True, f"[OK] Carpeta creada: {dst}"
+    except Exception as e:
+        return False, f"[ERROR] No se pudo crear carpeta: {e}"
+
+
+def _is_service_control_query(s: str) -> tuple[bool, str | None]:
+    t = _normalize_text(s)
+    if "activar servicio" in t or "iniciar servicio" in t or "start service" in t:
+        return True, "start"
+    if "detener servicio" in t or "desactivar servicio" in t or "stop service" in t:
+        return True, "stop"
+    return False, None
+
+
+def _extract_service_name(s: str) -> str | None:
+    m = re.search(r"servicio\s+['\"]([^'\"]{1,80})['\"]", s, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    m2 = re.search(r"servicio\s+([\w._\-]{1,80})", _normalize_text(s))
+    if m2:
+        return m2.group(1).strip()
+    # fallback: última palabra tipo token simple
+    toks = re.findall(r"[A-Za-z0-9._\-]{2,}", s)
+    return toks[-1] if toks else None
+
+
+def _service_control(action: str, name: str) -> tuple[bool, str]:
+    if platform.system() == "Darwin" and shutil.which("brew"):
+        cmd = ["brew", "services", "start" if action == "start" else "stop", name]
+        out = _run_cmd_capture(cmd, timeout=10)
+        ok = "Successfully" in out or "already" in out or out != ""
+        return ok, out or f"brew services {action} {name}"
+    # Linux user services
+    if shutil.which("systemctl"):
+        cmd = ["systemctl", "--user", "start" if action == "start" else "stop", f"{name}.service"]
+        out = _run_cmd_capture(cmd, timeout=10)
+        ok = "Started" in out or "Stopped" in out or out != ""
+        return ok, out or f"systemctl --user {action} {name}.service"
+    return False, "No encontré gestor de servicios compatible (brew/systemctl)."
+
+
 def _is_find_file_query(s: str) -> bool:
     t = _normalize_text(s)
     keys = ["donde esta", "dónde está", "ubica archivo", "buscar archivo", "encuentra archivo", "find file", "locate file"]
     return any(k in t for k in keys)
+
+
+# -------------------- Intent local: clima/tiempo (respuestas limpias) --------------------
+
+def _is_weather_query(s: str) -> bool:
+    t = _normalize_text(s)
+    keys = [
+        "clima", "tiempo", "pronostico", "pronóstico", "weather", "forecast",
+    ]
+    return any(k in t for k in keys)
+
+
+def _extract_weather_params(s: str) -> tuple[str | None, str]:
+    """Devuelve (ciudad, dia) donde dia ∈ {"hoy","mañana"}. Por defecto infiere por texto.
+    Heurística simple: busca "en <ciudad>" o comillas; si no, None.
+    """
+    t = _normalize_text(s)
+    # Día
+    day = "mañana" if "manana" in t or "mañana" in s.lower() else ("hoy" if "hoy" in t else "mañana")
+    # Ciudad: entre comillas
+    m = re.search(r"['\"]([^'\"]+)['\"]", s)
+    if m:
+        return m.group(1).strip(), day
+    # después de "en "
+    m2 = re.search(r"\ben\s+([\wÁÉÍÓÚÜÑáéíóúüñ .\-]{2,})", s)
+    if m2:
+        # cortar en signos de pregunta o fin
+        city = m2.group(1).strip()
+        city = re.split(r"[\?\n]", city)[0].strip()
+        return city, day
+    # última palabra capitalizada como candidato (arriesgado)
+    words = re.findall(r"[A-ZÁÉÍÓÚÜÑ][\wÁÉÍÓÚÜÑáéíóúüñ.\-]+", s)
+    if words:
+        return words[-1], day
+    return None, day
+
+
+def _fetch_weather_wttr(city: str, day: str, *, timeout: float = 12.0) -> tuple[bool, str]:
+    """Obtiene pronóstico desde wttr.in en JSON y devuelve texto legible.
+    day: "hoy" o "mañana". Usa índice 0 u 1 del arreglo weather.
+    """
+    try:
+        url = f"https://wttr.in/{quote_plus(city)}?format=j1"
+        req = urllib.request.Request(url, headers={"User-Agent": "PiperCLI/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+    except Exception as e:
+        return False, f"No pude obtener el clima ahora mismo ({e})."
+    try:
+        days = data.get("weather") or []
+        idx = 1 if day == "mañana" else 0
+        if idx >= len(days):
+            idx = min(len(days) - 1, 0)
+        d = days[idx]
+        date = d.get("date")
+        maxC = d.get("maxtempC")
+        minC = d.get("mintempC")
+        hourly = d.get("hourly") or []
+        # seleccionar alrededor del mediodía si existe
+        mid = None
+        for h in hourly:
+            if str(h.get("time", "")) in ("1200", "120", "12:00", "1200.0"):
+                mid = h
+                break
+        if mid is None and hourly:
+            mid = hourly[len(hourly)//2]
+        desc = (mid.get("weatherDesc", [{}])[0].get("value") if isinstance(mid, dict) else None) or "(sin descripción)"
+        precip = (mid.get("chanceofrain") if isinstance(mid, dict) else None) or (mid.get("chanceofprecipitation") if isinstance(mid, dict) else None) or "-"
+        windKmph = (mid.get("windspeedKmph") if isinstance(mid, dict) else None) or "-"
+        feels = (mid.get("FeelsLikeC") if isinstance(mid, dict) else None) or (mid.get("FeelsLikeC") if isinstance(mid, dict) else None)
+        parts = [
+            f"Pronóstico para {city} — {day} ({date}):",
+            f"- Máx {maxC}°C, Mín {minC}°C",
+            f"- Al mediodía: {desc}",
+            f"- Lluvia: {precip}%  •  Viento: {windKmph} km/h" + (f"  •  Sensación: {feels}°C" if feels else ""),
+            "Fuente: wttr.in (datos agregados)",
+        ]
+        return True, "\n".join(parts)
+    except Exception:
+        return False, "No pude interpretar la respuesta del servicio del clima."
 
 
 def _extract_filename_term(s: str) -> str | None:
@@ -627,6 +840,8 @@ def _wants_web_search(s: str) -> bool:
     keys = [
         "sitios web", "paginas web", "websites", "links", "fuentes",
         "dime", "recomienda", "donde puedo", "donde encontrar", "where can i find",
+        "que es", "qué es", "como", "cómo", "tutorial", "guia", "guía", "mejores",
+        "comparativa", "review", "latest", "ultimo", "último", "hoy", "noticias",
     ]
     # debe pedir sitios/links y no incluir URLs ya
     return any(k in t for k in keys) and not bool(_extract_urls(s))
@@ -703,6 +918,178 @@ def stop_ollama_service() -> tuple[bool, str]:
             return True, "ollama detenido"
     except Exception as e:
         return False, f"Error al detener Ollama: {e}"
+
+
+# -------------------- Piper Server (HTTP local) --------------------
+
+def _server_logs_dir() -> Path:
+    return _ollama_logs_dir().parent / "logs"
+
+
+def _server_pidfile() -> Path:
+    return _server_logs_dir() / "piper-server.pid"
+
+
+class _PiperHTTPHandler:
+    def __init__(self, reader, writer, model: str):
+        self.reader = reader
+        self.writer = writer
+        self.model = model
+
+    async def handle(self):
+        try:
+            data = await self.reader.read(65536)
+            req = data.decode("utf-8", errors="ignore")
+            # muy simple: solo GET /ping y /ask?prompt=
+            first = req.splitlines()[0] if req else ""
+            path = first.split(" ")[1] if len(first.split(" ")) >= 2 else "/"
+            status = "200 OK"
+            body = "{}"
+            headers = "Content-Type: application/json\r\n"
+            if path.startswith("/ping"):
+                body = json.dumps({"ok": True, "ts": datetime.now().isoformat(timespec="seconds")})
+            elif path.startswith("/ask"):
+                # soporta GET /ask?prompt=...
+                try:
+                    from urllib.parse import parse_qs, urlparse
+                    q = parse_qs(urlparse(path).query)
+                    prompt = (q.get("prompt", [""])[0] or "").strip()
+                except Exception:
+                    prompt = ""
+                if not prompt:
+                    status = "400 Bad Request"
+                    body = json.dumps({"ok": False, "error": "missing prompt"})
+                else:
+                    # Intents rápidos primero (clima)
+                    txt = None
+                    if _is_weather_query(prompt):
+                        city, day = _extract_weather_params(prompt)
+                        if city:
+                            ok, txt2 = _fetch_weather_wttr(city, day)
+                            txt = txt2 if ok else txt2
+                    if not txt:
+                        # respuesta concisa tipo assist
+                        system = {"role": "system", "content": (
+                            "Eres un asistente técnico en Piper CLI. Responde conciso y útil. "
+                            "Si falta un dato crítico, formula UNA pregunta corta."
+                        )}
+                        user = {"role": "user", "content": prompt}
+                        txt = _ollama_chat([system, user], self.model)
+                    body = json.dumps({"ok": True, "text": txt or ""})
+            else:
+                status = "404 Not Found"
+                body = json.dumps({"ok": False, "error": "not found"})
+            resp = (
+                f"HTTP/1.1 {status}\r\n"
+                + headers
+                + f"Content-Length: {len(body.encode('utf-8'))}\r\n"
+                + "Connection: close\r\n\r\n"
+                + body
+            )
+            self.writer.write(resp.encode("utf-8"))
+            await self.writer.drain()
+        except Exception:
+            try:
+                self.writer.close()
+            except Exception:
+                pass
+
+
+def _serve_http(host: str, port: int, model: str):
+    # Implementación sencilla con asyncio Streams para evitar dependencias
+    import asyncio
+    async def client_connected(reader, writer):
+        handler = _PiperHTTPHandler(reader, writer, model)
+        await handler.handle()
+    async def main_loop():
+        server = await asyncio.start_server(client_connected, host, port)
+        addrs = ", ".join(str(sock.getsockname()) for sock in server.sockets)
+        print(f"[SERVER] Piper en {addrs}")
+        async with server:
+            await server.serve_forever()
+    asyncio.run(main_loop())
+
+
+def _server_background_cmd(port: int) -> str:
+    py = sys.executable
+    this = str(Path(__file__).resolve())
+    logdir = _server_logs_dir()
+    mkdirp(logdir)
+    log = logdir / "piper-server.log"
+    return f"nohup {py} {json.dumps(this)} server run --port {port} >>{json.dumps(str(log))} 2>&1 & echo $! > {json.dumps(str(_server_pidfile()))}"
+
+
+def cmd_server_on(args: argparse.Namespace) -> int:
+    port = int(getattr(args, "port", 8787) or 8787)
+    # Si ya hay pidfile, informar
+    pidf = _server_pidfile()
+    if pidf.exists():
+        try:
+            pid = int(pidf.read_text().strip())
+            if pid > 0:
+                print(f"[INFO] Piper server ya parece activo (pid {pid}).")
+                return 0
+        except Exception:
+            pass
+    cmd = _server_background_cmd(port)
+    os.system(cmd)
+    print(f"[OK] Piper server iniciado en 127.0.0.1:{port}")
+    return 0
+
+
+def cmd_server_off(_args: argparse.Namespace) -> int:
+    pidf = _server_pidfile()
+    if pidf.exists():
+        try:
+            pid = int(pidf.read_text().strip())
+            os.kill(pid, 15)
+            time.sleep(0.3)
+        except Exception:
+            pass
+        try:
+            pidf.unlink(missing_ok=True)  # type: ignore[arg-type]
+        except Exception:
+            pass
+        print("[OK] Piper server detenido")
+        return 0
+    # Fallback: pkill
+    os.system("pkill -f 'piper_cli.py server run'")
+    print("[INFO] Intento de detener procesos 'piper server run'")
+    return 0
+
+
+def cmd_server_status(_args: argparse.Namespace) -> int:
+    pidf = _server_pidfile()
+    if pidf.exists():
+        try:
+            pid = int(pidf.read_text().strip())
+            os.kill(pid, 0)
+            print(f"[OK] Piper server activo (pid {pid})")
+            return 0
+        except Exception:
+            pass
+    print("[INFO] Piper server no está activo")
+    return 1
+
+
+def cmd_server_run(args: argparse.Namespace) -> int:
+    port = int(getattr(args, "port", 8787) or 8787)
+    model = _ensure_model_available(_resolve_model(getattr(args, "model", None)))
+    # Escribir pidfile
+    pidf = _server_pidfile()
+    mkdirp(pidf.parent)
+    try:
+        pidf.write_text(str(os.getpid()))
+    except Exception:
+        pass
+    try:
+        _serve_http("127.0.0.1", port, model)
+    finally:
+        try:
+            pidf.unlink(missing_ok=True)  # type: ignore[arg-type]
+        except Exception:
+            pass
+    return 0
 
 
 # -------------------- Ollama integración opcional --------------------
@@ -1473,411 +1860,45 @@ def _validate_ai_relpath(base: Path, cand: str) -> tuple[bool, str, Path | None]
 # -------------------- Plantillas --------------------
 
 def scaffold_flask(dst: Path, prompt: str) -> None:
-    write_file(dst / "requirements.txt", "flask\n")
-    write_file(dst / "app.py", """
-from flask import Flask
-app = Flask(__name__)
-
-@app.get('/')
-def hello():
-    return 'Hola desde Flask + Piper!'
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
-""".lstrip())
-    write_file(dst / "tests" / "test_basic.py", """
-def test_truth():
-    assert True
-""".lstrip())
-    write_file(dst / "README.md", f"""# {dst.name}\n\nGenerado por Piper (Flask) desde el prompt:\n\n> {prompt}\n\n## Ejecutar\n\npython3 -m venv .venv\nsource .venv/bin/activate\npip install -r requirements.txt\npython app.py\n\n## Probar\n\npython -m unittest discover -s tests -p 'test_*.py'\n""")
+    """[DEPRECATED] Esta función ya no se usa (se retiró 'piper project')."""
+    pass
 
 
 def scaffold_fastapi(dst: Path, prompt: str) -> None:
-    write_file(dst / "requirements.txt", "fastapi\nuvicorn\n")
-    write_file(dst / "main.py", """
-from fastapi import FastAPI
-app = FastAPI()
-
-@app.get('/')
-def hola():
-    return {'msg': 'Hola desde FastAPI + Piper!'}
-
-# uvicorn main:app --reload
-""".lstrip())
-    write_file(dst / "tests" / "test_basic.py", """
-def test_truth():
-    assert True
-""".lstrip())
-    write_file(dst / "README.md", f"""# {dst.name}\n\nGenerado por Piper (FastAPI) desde el prompt:\n\n> {prompt}\n\n## Ejecutar\n\npython3 -m venv .venv\nsource .venv/bin/activate\npip install -r requirements.txt\nuvicorn main:app --reload\n\n## Probar\n\npython -m unittest discover -s tests -p 'test_*.py'\n""")
+    """[DEPRECATED] Esta función ya no se usa (se retiró 'piper project')."""
+    pass
 
 
 def scaffold_python(dst: Path, prompt: str) -> None:
-    write_file(dst / "requirements.txt", "")
-    write_file(dst / "main.py", """
-print('Hola desde Piper CLI!')
-""".lstrip())
-    write_file(dst / "tests" / "test_basic.py", """
-def test_truth():
-    assert True
-""".lstrip())
-    write_file(dst / "README.md", f"""# {dst.name}\n\nGenerado por Piper (Python) desde el prompt:\n\n> {prompt}\n\n## Ejecutar\n\npython3 main.py\n\n## Probar\n\npython -m unittest discover -s tests -p 'test_*.py'\n""")
+    """[DEPRECATED] Esta función ya no se usa (se retiró 'piper project')."""
+    pass
 
 
 def scaffold_node(dst: Path, prompt: str) -> None:
-    write_file(dst / "package.json", """
-{
-  "name": "%s",
-  "version": "0.1.0",
-  "private": true,
-  "type": "module",
-  "scripts": {"start": "node index.js"}
-}
-""".strip() % dst.name)
-    write_file(dst / "index.js", """
-console.log('Hola desde Node + Piper!');
-""".lstrip())
-    write_file(dst / "README.md", f"""# {dst.name}\n\nGenerado por Piper (Node) desde el prompt:\n\n> {prompt}\n\n## Ejecutar\n\nnode index.js\n""")
+    """[DEPRECATED] Esta función ya no se usa (se retiró 'piper project')."""
+    pass
 
 
 def scaffold_react(dst: Path, prompt: str) -> None:
-    write_file(dst / "src" / "App.jsx", """
-export default function App() {
-  return <h1>Hola desde React + Piper</h1>
-}
-""".lstrip())
-    write_file(dst / "package.json", """
-{
-  "name": "%s",
-  "version": "0.1.0",
-  "private": true,
-  "type": "module",
-  "scripts": {"dev": "echo 'Agrega tu bundler (Vite) y corre'"}
-}
-""".strip() % dst.name)
-    write_file(dst / "README.md", f"""# {dst.name}\n\nGenerado por Piper (React) desde el prompt:\n\n> {prompt}\n\n## Siguiente paso\n\nInicializa tu bundler favorito (Vite) y conecta src/App.jsx\n""")
+    """[DEPRECATED] Esta función ya no se usa (se retiró 'piper project')."""
+    pass
 
 
 def scaffold_go(dst: Path, prompt: str) -> None:
-    write_file(dst / "main.go", """
-package main
-import "fmt"
-func main(){ fmt.Println("Hola desde Go + Piper!") }
-""".lstrip())
-    write_file(dst / "README.md", f"""# {dst.name}\n\nGenerado por Piper (Go) desde el prompt:\n\n> {prompt}\n\n## Ejecutar\n\ngo run main.go\n""")
+    """[DEPRECATED] Esta función ya no se usa (se retiró 'piper project')."""
+    pass
 
 
 # -------------------- Comando principal --------------------
 
 def create_project(prompt: str, name: str | None, base_dir: Path) -> Tuple[Path, str]:
-    stack = detect_stack(prompt)
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    proj_name = slugify(name or f"piper-{stack}-{ts}")
-    dst = base_dir / proj_name
-    if dst.exists():
-        raise SystemExit(f"[ERROR] Ya existe: {dst}")
-    mkdirp(dst)
-    if stack == "flask":
-        scaffold_flask(dst, prompt)
-    elif stack == "fastapi":
-        scaffold_fastapi(dst, prompt)
-    elif stack == "node":
-        scaffold_node(dst, prompt)
-    elif stack == "react":
-        scaffold_react(dst, prompt)
-    elif stack == "go":
-        scaffold_go(dst, prompt)
-    else:
-        scaffold_python(dst, prompt)
-    return dst, stack
+    """[DEPRECATED] Crear proyecto ya no está soportado directamente. Usa 'piper agent'."""
+    raise SystemExit("[ERROR] 'piper project' fue retirado. Usa 'piper agent' para automatizar pasos.")
 
 
-def cmd_project(args: argparse.Namespace) -> int:
-    progress_start("Preparando proyecto", 3)
-    # Preguntar SIEMPRE por directorio destino, con default desde memoria o arg
-    mem = get_config() or {}
-    default_dir = args.dir or mem.get("project", {}).get("default_dir") or str(Path.cwd())
-    try:
-        user_in = _ask_input(f"Directorio destino del proyecto [{default_dir}]: ")
-    except _UserCanceled:
-        print("[CANCELADO] Operación interrumpida por el usuario.")
-        return 130
-    chosen_dir = Path(user_in or default_dir).expanduser().resolve()
-    # Persistir preferencia última usada
-    mem.setdefault("project", {})["default_dir"] = str(chosen_dir)
-    try:
-        save_config(mem)
-    except Exception:
-        pass
-    base_dir = chosen_dir
-    base_dir.mkdir(parents=True, exist_ok=True)
-    dst, stack = create_project(args.prompt, args.name, base_dir)
-    progress_end()
-    print(f"[OK] Proyecto creado: {dst}  (stack: {stack})")
-    if _tts_on(None):
-        speak(os.environ.get("PIPER_ON_CREATE_MSG", "Proyecto creado"))
-    # Investigación opcional por URL(s)
-    research_md = ""
-    if getattr(args, "research_url", None):
-        urls = [u for u in (args.research_url or []) if isinstance(u, str) and u.strip()]
-        if urls:
-            print(f"[INFO] Ejecutando investigación en {len(urls)} URL(s)...")
-            research_md = research_urls(urls)
-            try:
-                write_file(dst / "RESEARCH_NOTES.md", research_md)
-                print("[OK] RESEARCH_NOTES.md generado")
-            except Exception as e:
-                print(f"[WARN] No se pudo escribir RESEARCH_NOTES.md: {e}")
-    # Notas AI opcionales vía Ollama
-    model = args.ollama_model
-    # --fast fuerza un modelo ligero por ejecución
-    if getattr(args, "fast", False):
-        model = "phi3:mini"
-    # Flags por defecto: AI y archivos IA activados; permitir desactivar con --no-ai / --no-ai-files
-    ai_enabled = bool(getattr(args, "ai", False)) and not bool(getattr(args, "no_ai", False))
-    ai_files_enabled = bool(getattr(args, "ai_files", False)) and not bool(getattr(args, "no_ai_files", False))
-    auto_apply = bool(getattr(args, "auto_apply_notes", False)) and not bool(getattr(args, "no_auto_apply_notes", False))
-    max_files = int(getattr(args, "max_files", 0) or 0)
-    if ai_enabled and not model:
-        model = os.environ.get("PIPER_OLLAMA_MODEL") or None
-    # Resolver a un modelo instalado/usable sólo si AI está habilitado
-    model = _ensure_model_available(_resolve_model(model)) if ai_enabled else None
-    # Cargar defaults de configuración persistente
-    defaults_cfg = (get_config() or {}).get("defaults", {})
-    # Si el usuario no especificó límites (están en default), usar los de config si existen
-    if getattr(args, "max_ai_bytes", AI_TOTAL_BYTES_DEFAULT) == AI_TOTAL_BYTES_DEFAULT:
-        if isinstance(defaults_cfg.get("max_ai_bytes"), int):
-            args.max_ai_bytes = int(defaults_cfg.get("max_ai_bytes"))
-    if getattr(args, "max_ai_file_bytes", AI_FILE_BYTES_DEFAULT) == AI_FILE_BYTES_DEFAULT:
-        if isinstance(defaults_cfg.get("max_ai_file_bytes"), int):
-            args.max_ai_file_bytes = int(defaults_cfg.get("max_ai_file_bytes"))
-
-    if ai_enabled and model:
-        try:
-            progress_start("Generando notas con IA", 15)
-            prompt_for_ai = args.prompt
-            if research_md:
-                prompt_for_ai = (
-                    f"{args.prompt}\n\nContexto de investigación (ideas, referencias, sin código copiado):\n{research_md}\n"
-                )
-            notes = ollama_notes(prompt=prompt_for_ai, stack=stack, model=model)
-            if notes:
-                (dst / "AI_NOTES.md").write_text(notes, encoding="utf-8")
-                print(f"[OK] AI_NOTES.md generado con {model}")
-                if research_md and getattr(args, "research_merge", False):
-                    try:
-                        with (dst / "AI_NOTES.md").open("a", encoding="utf-8") as fh:
-                            fh.write("\n\n" + research_md)
-                        print("[OK] Investigación anexada a AI_NOTES.md")
-                    except Exception as e:
-                        print(f"[WARN] No se pudo anexar investigación a AI_NOTES.md: {e}")
-            progress_end()
-        except Exception as e:
-            print(f"[WARN] No se pudo generar AI_NOTES.md (modelo={model}): {e}")
-        # Generar archivos por IA opcionalmente (iniciales)
-        if ai_files_enabled:
-            try:
-                progress_start("Generando archivos con IA", 20)
-                max_total = int(getattr(args, "max_ai_bytes", AI_TOTAL_BYTES_DEFAULT) or AI_TOTAL_BYTES_DEFAULT)
-                max_file = int(getattr(args, "max_ai_file_bytes", AI_FILE_BYTES_DEFAULT) or AI_FILE_BYTES_DEFAULT)
-                used = 0
-                files = ollama_files(prompt=args.prompt, stack=stack, model=model, max_files=max_files, mode=None).get("files", [])
-                if not files:
-                    print("[WARN] La IA no propuso archivos o JSON vacío")
-                else:
-                    print("[PLAN] Archivos propuestos por IA:")
-                    for f in files:
-                        print(f" - {f.get('path')}")
-                    # Revisión por fichero con diff y confirmación (a menos que -y)
-                    for f in files:
-                        rel_raw = f.get("path") or ""
-                        content = _sanitize_generated_content(f.get("content") or "")
-                        ok_path, rel_norm, target = _validate_ai_relpath(dst, rel_raw)
-                        if not ok_path or target is None:
-                            motivo = rel_norm or "inválida"
-                            print(f"[SKIP] Ruta inválida: {rel_raw} (razón: {motivo})")
-                            continue
-                        # Guardas: tamaño total y por archivo, y evitar binarios aparentes
-                        content_bytes = content.encode("utf-8", errors="ignore")
-                        size = len(content_bytes)
-                        if size > max_file:
-                            print(f"[SKIP] {rel_norm}: supera el máximo por archivo ({size} > {max_file} bytes)")
-                            continue
-                        if used + size > max_total:
-                            print(f"[STOP] Límite total de IA alcanzado ({used + size} > {max_total} bytes). Deteniendo escritura.")
-                            break
-                        if _is_probably_binary(content):
-                            print(f"[SKIP] {rel_norm}: contenido parece binario o no textual")
-                            continue
-                        if getattr(args, "show_diff", False):
-                            old = ""
-                            if target.exists():
-                                try:
-                                    old = target.read_text(encoding="utf-8")
-                                except Exception:
-                                    old = ""
-                            if old != content:
-                                diff = difflib.unified_diff(
-                                    old.splitlines(), content.splitlines(),
-                                    fromfile=str(target), tofile=f"new:{rel_norm}", lineterm=""
-                                )
-                                print("\n--- Diff:")
-                                for line in diff:
-                                    print(line)
-                            else:
-                                print(f"[SAME] Sin cambios para {rel_norm}")
-                        do_write = bool(getattr(args, "yes", False)) and not bool(getattr(args, "ask", False))
-                        if not do_write:
-                            ans = input(f"¿Escribir {rel_norm}? (y/N): ").strip().lower()
-                            do_write = ans in ("y", "s", "yes", "si")
-                        if do_write:
-                            write_file(target, content)
-                            used += size
-                            print(f"[OK] Escrito {rel_norm}")
-                    print("\n[OK] Revisión AI completada.")
-                progress_end()
-            except Exception as e:
-                print(f"[WARN] No se pudieron generar archivos AI: {e}")
-
-        # Preguntar si desea aplicar mejoras y pasos de AI_NOTES.md
-        notes_path = dst / "AI_NOTES.md"
-        if notes_path.exists():
-            proceed = auto_apply
-            if not proceed:
-                # Consultar decisión previa en contexto
-                prior = _ctx_get_decision("apply.ai_notes")
-                if prior in ("accepted", "declined"):
-                    proceed = prior == "accepted"
-                else:
-                    try:
-                        apply_ans = _ask_input("¿Aplicar ahora las mejoras y pasos de AI_NOTES.md? (y/N): ").lower()
-                    except _UserCanceled:
-                        apply_ans = ""
-                    proceed = apply_ans in ("y", "s", "yes", "si")
-                    _ctx_record_decision("apply.ai_notes", "accepted" if proceed else "declined")
-            if proceed:
-                try:
-                    text = notes_path.read_text(encoding="utf-8")
-                except Exception as e:
-                    print(f"[ERROR] No se pudo leer AI_NOTES.md: {e}")
-                    text = ""
-                if text:
-                    try:
-                        progress_start("Aplicando mejoras desde notas", 20)
-                        plan = ollama_files(prompt=text, stack=stack, model=model, max_files=max_files, mode="notes")
-                    except Exception as e:
-                        print(f"[ERROR] No se pudo obtener archivos de IA desde notas: {e}")
-                        plan = {"files": []}
-                    files2 = plan.get("files", []) if isinstance(plan, dict) else []
-                    if not files2:
-                        print("[WARN] Las notas no produjeron archivos para aplicar.")
-                    else:
-                        print("[PLAN] Archivos desde notas (orden sugerido):")
-                        for f in files2:
-                            print(f" - {f.get('path')}")
-                        for f in files2:
-                            rel_raw = f.get("path") or ""
-                            content = _sanitize_generated_content(f.get("content") or "")
-                            ok_path, rel_norm, target = _validate_ai_relpath(dst, rel_raw)
-                            if not ok_path or target is None:
-                                motivo = rel_norm or "inválida"
-                                print(f"[SKIP] Ruta inválida: {rel_raw} (razón: {motivo})")
-                                continue
-                            # Guardas: tamaño y binario
-                            max_total2 = int(getattr(args, "max_ai_bytes", AI_TOTAL_BYTES_DEFAULT) or AI_TOTAL_BYTES_DEFAULT)
-                            max_file2 = int(getattr(args, "max_ai_file_bytes", AI_FILE_BYTES_DEFAULT) or AI_FILE_BYTES_DEFAULT)
-                            # reutilizamos 'used' si existe, sino iniciamos
-                            try:
-                                used
-                            except NameError:
-                                used = 0
-                            content_bytes = content.encode("utf-8", errors="ignore")
-                            size = len(content_bytes)
-                            if size > max_file2:
-                                print(f"[SKIP] {rel_norm}: supera el máximo por archivo ({size} > {max_file2} bytes)")
-                                continue
-                            if used + size > max_total2:
-                                print(f"[STOP] Límite total de IA alcanzado ({used + size} > {max_total2} bytes). Deteniendo escritura.")
-                                break
-                            if _is_probably_binary(content):
-                                print(f"[SKIP] {rel_norm}: contenido parece binario o no textual")
-                                continue
-                            if getattr(args, "show_diff", False):
-                                old = ""
-                                if target.exists():
-                                    try:
-                                        old = target.read_text(encoding="utf-8")
-                                    except Exception:
-                                        old = ""
-                                if old != content:
-                                    diff = difflib.unified_diff(
-                                        old.splitlines(), content.splitlines(),
-                                        fromfile=str(target), tofile=f"new:{rel_norm}", lineterm=""
-                                    )
-                                    print("\n--- Diff:")
-                                    for line in diff:
-                                        print(line)
-                                else:
-                                    print(f"[SAME] Sin cambios para {rel_norm}")
-                            # Respetar --ask si se pasó, si no, usar yes por defecto
-                            do_write = bool(getattr(args, "yes", True)) and not bool(getattr(args, "ask", False))
-                            if not do_write:
-                                try:
-                                    ans = _ask_input(f"¿Escribir {rel_norm}? (y/N): ").lower()
-                                except _UserCanceled:
-                                    ans = ""
-                                do_write = ans in ("y", "s", "yes", "si")
-                            if do_write:
-                                write_file(target, content)
-                                used += size
-                                print(f"[OK] Escrito {rel_norm}")
-                        print("\n[OK] Aplicación de notas completada.")
-                        progress_end()
-    # Verificación rápida post-creación (lint/sintaxis y pruebas básicas si existen)
-    try:
-        progress_start("Verificando proyecto", 5)
-        _summary = verify_project(dst, stack)
-        print(_summary)
-        progress_end()
-    except Exception as e:
-        print(f"[WARN] Verificación post-creación falló: {e}")
-    # Smoke run: por defecto en stack 'python' simple, o si --smoke-run está presente; desactivable con --no-smoke-run
-    smoke_default_python = (defaults_cfg.get("smoke_python_default") if isinstance(defaults_cfg, dict) else None)
-    if smoke_default_python is None:
-        smoke_default_python = True
-    do_smoke = bool(getattr(args, "smoke_run", False)) or (stack == "python" and bool(smoke_default_python) and not bool(getattr(args, "no_smoke_run", False)))
-    if do_smoke:
-        try:
-            progress_start("Prueba rápida (smoke run)", 5)
-            ok, msg = smoke_run(dst, stack, timeout=int(getattr(args, "smoke_timeout", 5) or 5))
-            print(msg)
-            progress_end()
-        except Exception as e:
-            print(f"[WARN] Smoke run falló: {e}")
-    # Resumen con mayordomo y árbol de proyecto
-    try:
-        summary_lines = [
-            f"Listo, se completó la creación del proyecto: {dst.name}",
-            "Estructura principal:",
-        ]
-        for ln in _dir_tree(dst, max_depth=2, max_entries=80):
-            summary_lines.append(ln)
-        print("\n" + _ascii_butler(summary_lines) + "\n")
-    except Exception:
-        pass
-    # Ofrecer nueva interacción
-    try:
-        ans = input("¿Gusta agregar o hacer otra opción? (y/N): ").strip().lower()
-    except EOFError:
-        ans = ""
-    if ans in ("y", "s", "yes", "si"):
-        try:
-            nxt = input("Escribe tu prompt (o ENTER para salir): ").strip()
-        except EOFError:
-            nxt = ""
-        if nxt:
-            ns = argparse.Namespace(prompt=nxt, model=None, no_tts=False)
-            return cmd_assist(ns)
-    return 0
+def cmd_project(_args: argparse.Namespace) -> int:
+    print("[ERROR] El subcomando 'project' fue retirado. Usa 'piper agent'.")
+    return 2
 
 
 def cmd_assist(args: argparse.Namespace) -> int:
@@ -1929,6 +1950,43 @@ def cmd_assist(args: argparse.Namespace) -> int:
             speak(text)
         _maybe_save_output(Path.cwd(), getattr(args, "save", None), text, append=bool(getattr(args, "append", False)))
         return 0
+    # Intento local: estado del sistema
+    if _is_system_status_query(prompt0):
+        text = _system_status_text()
+        print(text)
+        if _tts_on(args) and not args.no_tts:
+            speak(text)
+        _maybe_save_output(Path.cwd(), getattr(args, "save", None), text, append=bool(getattr(args, "append", False)))
+        return 0
+    # Intento local: crear carpeta en Descargas
+    if _is_create_folder_query(prompt0):
+        name = _extract_folder_name(prompt0)
+        if not name:
+            try:
+                name = _ask_input("Nombre de la carpeta en Descargas: ")
+            except _UserCanceled:
+                name = ""
+        if not name:
+            print("[CANCELADO] Sin nombre de carpeta.")
+            return 2
+        ok, msg = _create_folder_in_downloads(name)
+        print(msg)
+        return 0 if ok else 1
+    # Intento local: control de servicios
+    svc_hit, action = _is_service_control_query(prompt0)
+    if svc_hit:
+        name = _extract_service_name(prompt0)
+        if not name:
+            try:
+                name = _ask_input("Nombre del servicio: ")
+            except _UserCanceled:
+                name = ""
+        if not name:
+            print("[CANCELADO] Sin nombre de servicio.")
+            return 2
+        ok, out = _service_control(action or "start", name)
+        print(out or ("[OK]" if ok else "[ERROR]"))
+        return 0 if ok else 1
     # Intento local: búsqueda de archivo (por defecto, busca desde la raíz del sistema)
     if _is_find_file_query(prompt0):
         term = _extract_filename_term(prompt0)
@@ -1952,6 +2010,33 @@ def cmd_assist(args: argparse.Namespace) -> int:
         text = "\n".join(lines)
         print(text)
         _maybe_save_output(base, getattr(args, "save", None), text, append=bool(getattr(args, "append", False)))
+        return 0
+    # Intento local: clima/tiempo (evita bucles, respuesta directa)
+    if _is_weather_query(prompt0):
+        city, day = _extract_weather_params(prompt0)
+        if not city:
+            try:
+                ans = _ask_input("¿Qué ciudad deseas consultar? (ENTER para cancelar): ")
+            except _UserCanceled:
+                ans = ""
+            city = ans.strip() or None
+        if not city:
+            print("[CANCELADO] Sin ciudad, no puedo responder.")
+            return 2
+        ok, txt = _fetch_weather_wttr(city, day)
+        if not ok:
+            # Fallback a búsqueda web simple
+            try:
+                q = f"clima {day} {city}"
+                urls = search_web(q, max_results=3, timeout=float(getattr(args, "web_timeout", 15) or 15))
+                md = research_urls(urls[:3]) if urls else ""
+            except Exception as e:
+                md = f"No se pudo obtener info web: {e}"
+            txt = f"No pude obtener datos en tiempo real. A continuación, un resumen web:\n{md}"
+        print(txt)
+        if _tts_on(args) and not args.no_tts:
+            speak(txt)
+        _maybe_save_output(Path.cwd(), getattr(args, "save", None), txt, append=bool(getattr(args, "append", False)))
         return 0
     # Web + LLM: si --web está activo, usar investigación + modelo para responder al prompt (tiene prioridad)
     if getattr(args, "web", False):
@@ -2042,154 +2127,24 @@ def cmd_assist(args: argparse.Namespace) -> int:
             return 0
         except Exception as e:
             print(f"[ERROR] No se pudo obtener resumen web: {e}")
-    # Modo libre tipo chat: respuesta de texto del modelo directamente
-    if getattr(args, "freeform", False):
-        model = _ensure_model_available(_resolve_model(args.model))
-        system = {
-            "role": "system",
-            "content": (
-                "Eres un asistente técnico integrado en Piper CLI (local). "
-                "Responde de manera clara y útil. Si el usuario pide crear contenido, redacta en Markdown. "
-                "No confundas Piper CLI con productos de Amazon/Alexa u otros 'Piper'."
-            ),
-        }
-        messages: List[Dict[str, Any]] = [system, {"role": "user", "content": prompt0}]
-        gen_est = int(getattr(args, "gen_estimate", 20) or 20)
-        out_text = with_progress("Generando respuesta (modelo)", gen_est, _ollama_chat, messages, model)
-        print(out_text)
-        if _tts_on(args) and not args.no_tts and out_text:
-            speak(out_text)
-        _maybe_save_output(Path.cwd(), getattr(args, "save", None), out_text, append=bool(getattr(args, "append", False)))
-        return 0
+    # Respuesta libre tipo Copilot: concisa por defecto (sin bucle de preguntas)
     model = _ensure_model_available(_resolve_model(args.model))
     system = {
         "role": "system",
         "content": (
-            "Contexto: Estás integrado en Piper CLI, una herramienta local de terminal que ayuda a convertir prompts en proyectos y tareas, "
-            "con integración a Ollama y TTS opcional. NO confundas Piper CLI con productos de Amazon, Alexa u otros proyectos llamados 'Piper'. "
-            "Si el usuario menciona 'Piper' sin más, asume que se refiere a Piper CLI local de este equipo. "
-            "Si percibes ambigüedad entre distintas marcas/tecnologías llamadas igual, pregunta para aclarar antes de afirmar. "
-            "Tu objetivo es ayudar a clarificar peticiones ambiguas; si la petición requiere más detalles, formula UNA pregunta específica y útil. "
-            "Si ya hay suficiente contexto, responde claramente. "
-            "Responde SIEMPRE en este formato JSON, sin texto adicional: "
-            "{\"type\":\"question\",\"text\":\"...\"} o {\"type\":\"answer\",\"text\":\"...\"}."
+            "Eres un asistente técnico integrado en Piper CLI. Responde conciso, claro y accionable. "
+            "Evita hacer preguntas a menos que sea estrictamente necesario; si falta un dato crítico, formula UNA pregunta corta. "
+            "Si se solicita código o ejemplos, usa Markdown. No confundas Piper CLI con productos de Amazon/Alexa u otros 'Piper'."
         ),
     }
-    user_content = (
-        "Nos referimos a 'Piper CLI' (este proyecto local), NO a productos de Amazon ni Alexa. "
-        "Si la petición es ambigua, pregunta primero. "
-        f"Petición: {args.prompt}"
-    )
-    messages: List[Dict[str, Any]] = [system, {"role": "user", "content": user_content}]
-    while True:
-        data = _ollama_chat_json(messages, model)
-        # data debería ser {type:"question"|"answer", text:"..."}
-        if not isinstance(data, dict) or not data:
-            # Fallback: texto simple
-            out_text = _ollama_chat(messages, model)
-            # Guardarraíl mínimo contra confusión Amazon
-            low = (out_text or "").lower()
-            if "amazon" in low and "piper" in low:
-                data = {"type": "question", "text": "¿Te refieres a Piper CLI (esta herramienta local) o a otro producto llamado Piper?"}
-            else:
-                print(out_text)
-                if not args.no_tts:
-                    speak(out_text)
-                return 0
-        t = (data or {}).get("type")
-        text = (data or {}).get("text") or ""
-        # Segundo guardarraíl: si el texto confunde con Amazon, pedir aclaración
-        lowt = text.lower()
-        if "amazon" in lowt and "piper" in lowt:
-            t = "question"
-            text = "¿Te refieres a Piper CLI (esta herramienta local) o a otro producto llamado Piper?"
-        if t == "question":
-            # Si la propia pregunta del modelo es sobre la fecha de hoy, responde localmente
-            if _is_date_query(text):
-                ans = _date_today_text()
-                print(ans)
-                if _tts_on(args) and not args.no_tts:
-                    speak(ans)
-                _maybe_save_output(Path.cwd(), getattr(args, "save", None), ans, append=bool(getattr(args, "append", False)))
-                return 0
-            # Si pregunta la hora
-            if _is_time_query(text):
-                ans = _time_now_text()
-                print(ans)
-                if _tts_on(args) and not args.no_tts:
-                    speak(ans)
-                _maybe_save_output(Path.cwd(), getattr(args, "save", None), ans, append=bool(getattr(args, "append", False)))
-                return 0
-            # Si pregunta directorio actual
-            if _is_cwd_query(text):
-                ans = _cwd_text()
-                print(ans)
-                if _tts_on(args) and not args.no_tts:
-                    speak(ans)
-                _maybe_save_output(Path.cwd(), getattr(args, "save", None), ans, append=bool(getattr(args, "append", False)))
-                return 0
-            # Si la pregunta trae URL(s) y parece pedir resumen
-            urls_q = _extract_urls(text)
-            if urls_q and _wants_web_summary(text):
-                try:
-                    md = research_urls(urls_q[:3])
-                    print(md)
-                    _maybe_save_output(Path.cwd(), getattr(args, "save", None), md, append=bool(getattr(args, "append", False)))
-                    return 0
-                except Exception as e:
-                    print(f"[ERROR] No se pudo obtener resumen web: {e}")
-            print(text)
-            try:
-                answer = _ask_input("> ")
-            except _UserCanceled:
-                print("[CANCELADO] Operación interrumpida por el usuario.")
-                return 130
-            # Si el usuario responde preguntando por la fecha, resolver localmente
-            if _is_date_query(answer):
-                ans = _date_today_text()
-                print(ans)
-                if _tts_on(args) and not args.no_tts:
-                    speak(ans)
-                _maybe_save_output(Path.cwd(), getattr(args, "save", None), ans, append=bool(getattr(args, "append", False)))
-                return 0
-            if _is_time_query(answer):
-                ans = _time_now_text()
-                print(ans)
-                if not args.no_tts:
-                    speak(ans)
-                _maybe_save_output(Path.cwd(), getattr(args, "save", None), ans, append=bool(getattr(args, "append", False)))
-                return 0
-            if _is_cwd_query(answer):
-                ans = _cwd_text()
-                print(ans)
-                if not args.no_tts:
-                    speak(ans)
-                _maybe_save_output(Path.cwd(), getattr(args, "save", None), ans, append=bool(getattr(args, "append", False)))
-                return 0
-            urls_a = _extract_urls(answer)
-            if urls_a and _wants_web_summary(answer):
-                try:
-                    md = research_urls(urls_a[:3])
-                    print(md)
-                    _maybe_save_output(Path.cwd(), getattr(args, "save", None), md, append=bool(getattr(args, "append", False)))
-                    return 0
-                except Exception as e:
-                    print(f"[ERROR] No se pudo obtener resumen web: {e}")
-            messages.append({"role": "assistant", "content": text})
-            messages.append({"role": "user", "content": answer})
-            continue
-        elif t == "answer":
-            print(text)
-            if _tts_on(args) and not args.no_tts:
-                speak(text)
-            _maybe_save_output(Path.cwd(), getattr(args, "save", None), text, append=bool(getattr(args, "append", False)))
-            return 0
-        else:
-            print(text)
-            if _tts_on(args) and not args.no_tts and text:
-                speak(text)
-            _maybe_save_output(Path.cwd(), getattr(args, "save", None), text, append=bool(getattr(args, "append", False)))
-            return 0
+    messages: List[Dict[str, Any]] = [system, {"role": "user", "content": prompt0}]
+    gen_est = int(getattr(args, "gen_estimate", 20) or 20)
+    out_text = with_progress("Generando respuesta (modelo)", gen_est, _ollama_chat, messages, model)
+    print(out_text)
+    if _tts_on(args) and not args.no_tts and out_text:
+        speak(out_text)
+    _maybe_save_output(Path.cwd(), getattr(args, "save", None), out_text, append=bool(getattr(args, "append", False)))
+    return 0
 
 
 def cmd_say(args: argparse.Namespace) -> int:
@@ -3261,31 +3216,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_assist.add_argument("--append", action="store_true", help="Anexar en vez de sobrescribir al usar --save")
     p_assist.set_defaults(func=cmd_assist, no_tts=True)
 
-    p_project = sub.add_parser("project", help="Genera un proyecto")
-    p_project.add_argument("prompt", help="Descripción del proyecto")
-    p_project.add_argument("--name", help="Nombre del proyecto")
-    p_project.add_argument("--dir", default=str(Path.cwd()), help="Directorio destino (por defecto: cwd)")
-    p_project.add_argument("--ollama-model", dest="ollama_model", help="Modelo Ollama para notas AI (ej. mistral:latest)")
-    p_project.add_argument("--ai", action="store_true", help="Alias de --ollama-model=$PIPER_OLLAMA_MODEL o valor por defecto")
-    p_project.add_argument("--no-ai", action="store_true", help="Desactivar generación de AI_NOTES.md")
-    p_project.add_argument("--ai-files", action="store_true", help="Genera archivos sugeridos por IA (JSON)")
-    p_project.add_argument("--no-ai-files", action="store_true", help="No generar archivos IA")
-    p_project.add_argument("-y", "--yes", action="store_true", help="No preguntar confirmación al escribir archivos IA")
-    p_project.add_argument("--ask", action="store_true", help="Pedir confirmación al escribir archivos IA")
-    p_project.add_argument("--fast", action="store_true", help="Usar modelo rápido (phi3:mini) en esta ejecución")
-    p_project.add_argument("--auto-apply-notes", action="store_true", help="Aplicar mejoras/pasos de AI_NOTES.md automáticamente")
-    p_project.add_argument("--no-auto-apply-notes", action="store_true", help="No aplicar automáticamente AI_NOTES.md")
-    p_project.add_argument("--max-files", type=int, default=0, help="Límite de archivos IA por fase (0 = sin límite)")
-    p_project.add_argument("--research-url", action="append", help="URL de investigación (repetible)")
-    p_project.add_argument("--research-merge", action="store_true", help="Anexar investigación a AI_NOTES.md")
-    p_project.add_argument("--smoke-run", action="store_true", help="Intentar una ejecución breve tras crear el proyecto")
-    p_project.add_argument("--smoke-timeout", type=int, default=5, help="Timeout de smoke run en segundos (por defecto 5)")
-    p_project.add_argument("--no-smoke-run", action="store_true", help="Desactiva el smoke run por defecto en stack 'python'")
-    p_project.add_argument("--max-ai-bytes", type=int, default=AI_TOTAL_BYTES_DEFAULT, help=f"Máximo de bytes a escribir por IA en un lote (por defecto {AI_TOTAL_BYTES_DEFAULT} bytes ~ {AI_TOTAL_BYTES_DEFAULT//(1024*1024)}MB)")
-    p_project.add_argument("--max-ai-file-bytes", type=int, default=AI_FILE_BYTES_DEFAULT, help=f"Máximo de bytes por archivo IA (por defecto {AI_FILE_BYTES_DEFAULT} bytes ~ {AI_FILE_BYTES_DEFAULT//(1024*1024)}MB)")
-    p_project.add_argument("--show-diff", action="store_true", help="Mostrar diff al aplicar archivos IA (por defecto oculto)")
-    # Por defecto: AI activado, archivos IA activados, escritura sin preguntar y aplicar notas automáticamente; sin límite de archivos
-    p_project.set_defaults(func=cmd_project, ai=True, ai_files=True, yes=True, auto_apply_notes=True, max_files=0)
+    # Subcomando 'project' retirado: mantenemos un alias que informa el cambio
+    p_project = sub.add_parser("project", help="[RETIRADO] Usa 'piper agent' en su lugar")
+    p_project.set_defaults(func=cmd_project)
 
     p_say = sub.add_parser("say", help="Decir un texto con Piper TTS")
     p_say.add_argument("text")
@@ -3319,6 +3252,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_off.set_defaults(func=cmd_service_off)
     p_off2 = sub.add_parser("OFF", help="Apaga el servicio Ollama")
     p_off2.set_defaults(func=cmd_service_off)
+
+    # Servidor local Piper (HTTP)
+    p_srv = sub.add_parser("server", help="Servidor local HTTP de Piper (on/off/status/run)")
+    srv_sub = p_srv.add_subparsers(dest="server_cmd")
+    p_srv_on = srv_sub.add_parser("on", help="Inicia servidor en background")
+    p_srv_on.add_argument("--port", type=int, default=8787, help="Puerto (por defecto 8787)")
+    p_srv_on.set_defaults(func=cmd_server_on)
+
+    p_srv_off = srv_sub.add_parser("off", help="Detiene servidor en background")
+    p_srv_off.set_defaults(func=cmd_server_off)
+
+    p_srv_status = srv_sub.add_parser("status", help="Estado del servidor")
+    p_srv_status.set_defaults(func=cmd_server_status)
+
+    p_srv_run = srv_sub.add_parser("run", help="Ejecuta el servidor en foreground (uso interno)")
+    p_srv_run.add_argument("--port", type=int, default=8787, help="Puerto (por defecto 8787)")
+    p_srv_run.add_argument("--model", help="Modelo Ollama (opcional)")
+    p_srv_run.set_defaults(func=cmd_server_run)
 
     # Aplicar propuestas desde AI_NOTES.md al proyecto
     p_apply = sub.add_parser("apply-notes", help="Genera y aplica archivos desde AI_NOTES.md con revisión")

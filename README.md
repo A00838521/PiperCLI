@@ -5,12 +5,10 @@ Asistente local de terminal que convierte prompts en proyectos y respuestas úti
 ## Qué incluye
 
 - Asistente (`piper assist`):
-
-   - Respuesta guiada (formato JSON interno) para aclarar intenciones.
-   - Modo libre (`--freeform`) para respuesta de texto directa.
-   - Con investigación web (`--web`): busca y resume sitios, usa ideas como contexto (sin copiar código).
-
-- Generación de proyectos (`piper project`): notas de IA, archivos sugeridos y verificación rápida (sintaxis/pruebas básicas).
+   - Respuestas concisas tipo Copilot (sin bucles de preguntas).
+   - Investigación web opcional (`--web`) o automática según el prompt (sin copiar código).
+   - Intents locales: fecha/hora, IP (local/pública), OS info, búsqueda de archivos y clima.
+- Agente (`piper agent`): planifica y ejecuta comandos con streaming e inteligencia web ante fallos.
 - Investigación web independiente (`piper research --url ...`).
 - Control de servicio Ollama (`piper on` / `piper off`).
 - Guardas de seguridad al escribir archivos (validación de rutas, límites de tamaño, sanitización de contenido IA).
@@ -83,10 +81,10 @@ piper assist "Genera un plan de pruebas para una API REST" --freeform --no-tts
 piper assist "Compara librerías de scraping en Python" --web --no-tts
 ```
 
-- Crear proyecto con IA y verificación rápida:
+- Agente (streaming + alternativas filtradas):
 
 ```bash
-piper project "API FastAPI con endpoint /salud" --ai --ai-files --auto-apply-notes --smoke-run
+piper agent "Inicializa un proyecto con Vite y React" --yes
 ```
 
 ## Parámetros y configuración
