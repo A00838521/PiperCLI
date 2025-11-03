@@ -35,6 +35,7 @@ import shutil
 from html.parser import HTMLParser
 from urllib.parse import urlparse, parse_qs, quote_plus, unquote
 import platform
+import socket
 
 try:
     from piper_tts import speak  # noqa: F401
@@ -276,6 +277,138 @@ def _cwd_text() -> str:
         return f"Directorio actual: {Path.cwd()}"
     except Exception:
         return "No pude determinar el directorio actual."
+
+
+# -------------------- Intents locales (sistema: IP, OS, búsqueda de archivos) --------------------
+
+def _is_ip_query(s: str) -> tuple[bool, str]:
+    """Detecta si el usuario pregunta por IP. Devuelve (True, tipo) donde tipo ∈ {"local", "publica", ""}.
+    Si no está claro, asume local.
+    """
+    t = _normalize_text(s)
+    if not t:
+        return False, ""
+    if "ip" not in t:
+        return False, ""
+    if any(k in t for k in ["publica", "pública", "externa"]):
+        return True, "publica"
+    return True, "local"
+
+
+def _get_local_ip() -> str:
+    try:
+        # Técnica robusta: abrir un socket UDP a una IP pública para conocer la interfaz de salida
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(2.0)
+        try:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+        finally:
+            s.close()
+        return f"IP local: {ip}"
+    except Exception:
+        try:
+            host = socket.gethostname()
+            ip = socket.gethostbyname(host)
+            return f"IP local: {ip}"
+        except Exception:
+            return "No pude determinar la IP local."
+
+
+def _get_public_ip(timeout: float = 5.0) -> str:
+    try:
+        # Probar api.ipify.org
+        req = urllib.request.Request("https://api.ipify.org", headers={"User-Agent": "PiperCLI/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            ip = (resp.read().decode("utf-8").strip())
+            if ip:
+                return f"IP pública: {ip}"
+    except Exception:
+        pass
+    try:
+        # Fallback ifconfig.me
+        req = urllib.request.Request("https://ifconfig.me/ip", headers={"User-Agent": "PiperCLI/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            ip = (resp.read().decode("utf-8").strip())
+            if ip:
+                return f"IP pública: {ip}"
+    except Exception:
+        pass
+    return "No pude determinar la IP pública (requiere conexión a internet)."
+
+
+def _is_os_info_query(s: str) -> bool:
+    t = _normalize_text(s)
+    keys = [
+        "sistema operativo", "version de macos", "version macos", "informacion del sistema",
+        "os version", "system info", "version del sistema",
+    ]
+    return any(k in t for k in keys)
+
+
+def _os_info_text() -> str:
+    try:
+        sysname = platform.system()
+        release = platform.release()
+        version = platform.version()
+        machine = platform.machine()
+        py = platform.python_version()
+        return f"Sistema: {sysname} {release} ({machine})\nVersión: {version}\nPython: {py}"
+    except Exception:
+        return "No pude obtener la información del sistema."
+
+
+def _is_find_file_query(s: str) -> bool:
+    t = _normalize_text(s)
+    keys = ["donde esta", "dónde está", "ubica archivo", "buscar archivo", "encuentra archivo", "find file", "locate file"]
+    return any(k in t for k in keys)
+
+
+def _extract_filename_term(s: str) -> str | None:
+    """Heurística simple para extraer un término de archivo del texto.
+    Busca tras 'archivo', 'file', o entre comillas.
+    """
+    # Entre comillas
+    m = re.search(r"['\"]([^'\"]+)['\"]", s)
+    if m:
+        return m.group(1).strip()
+    # Después de la palabra 'archivo' o 'file'
+    m = re.search(r"(?:archivo|file)\s+([\w._\-]+)", _normalize_text(s))
+    if m:
+        return m.group(1).strip()
+    # Último recurso: tomar la última palabra con punto (parece nombre de archivo)
+    cand = re.findall(r"[\w._\-]+\.[A-Za-z0-9]{1,6}", s)
+    if cand:
+        return cand[-1]
+    return None
+
+
+def _search_files(term: str, base: Path, *, max_results: int = 20) -> list[Path]:
+    base = base.resolve()
+    results: list[Path] = []
+    try:
+        # Si el término incluye separadores, úsalo tal cual; si no, usa rglob sobre nombre
+        if "/" in term or "\\" in term:
+            p = (base / term).resolve()
+            if p.exists():
+                results.append(p)
+        else:
+            # Buscar por nombre exacto o patrón simple
+            patts = [term]
+            if not any(term.endswith(ext) for ext in (".txt", ".md", ".py", ".json", ".yml", ".yaml")):
+                patts.append(f"**/{term}")
+            seen: set[Path] = set()
+            for patt in patts:
+                for p in base.rglob(patt):
+                    if p in seen:
+                        continue
+                    seen.add(p)
+                    results.append(p)
+                    if len(results) >= max_results:
+                        return results
+    except Exception:
+        pass
+    return results
 
 
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
@@ -1570,6 +1703,46 @@ def cmd_assist(args: argparse.Namespace) -> int:
         if not args.no_tts:
             speak(text)
         _maybe_save_output(Path.cwd(), getattr(args, "save", None), text, append=bool(getattr(args, "append", False)))
+        return 0
+    # Intento local: IP (local o pública)
+    is_ip, ip_kind = _is_ip_query(prompt0)
+    if is_ip:
+        if ip_kind == "publica":
+            text = _get_public_ip()
+        else:
+            text = _get_local_ip()
+        print(text)
+        if not args.no_tts:
+            speak(text)
+        _maybe_save_output(Path.cwd(), getattr(args, "save", None), text, append=bool(getattr(args, "append", False)))
+        return 0
+    # Intento local: información del sistema operativo
+    if _is_os_info_query(prompt0):
+        text = _os_info_text()
+        print(text)
+        if not args.no_tts:
+            speak(text)
+        _maybe_save_output(Path.cwd(), getattr(args, "save", None), text, append=bool(getattr(args, "append", False)))
+        return 0
+    # Intento local: búsqueda de archivo dentro del directorio actual
+    if _is_find_file_query(prompt0):
+        term = _extract_filename_term(prompt0)
+        if not term:
+            print("Indica el nombre del archivo, por ejemplo: buscar archivo \"README.md\"")
+            return 2
+        base = Path.cwd()
+        results = _search_files(term, base, max_results=20)
+        if not results:
+            text = f"No encontré '{term}' bajo {base}"
+            print(text)
+            if not args.no_tts:
+                speak(text)
+            _maybe_save_output(base, getattr(args, "save", None), text, append=bool(getattr(args, "append", False)))
+            return 0
+        lines = [f"Resultados (máx 20) buscando '{term}' bajo {base}:"] + [" - " + str(p) for p in results]
+        text = "\n".join(lines)
+        print(text)
+        _maybe_save_output(base, getattr(args, "save", None), text, append=bool(getattr(args, "append", False)))
         return 0
     # Web + LLM: si --web está activo, usar investigación + modelo para responder al prompt (tiene prioridad)
     if getattr(args, "web", False):
