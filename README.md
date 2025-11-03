@@ -145,7 +145,6 @@ piper agent "Inicializa un proyecto React (Vite) y correlo" --web --background -
 ```
 
 ```md
-
 - Flags de agent:
   - `--cwd DIR`: directorio de trabajo.
   - `--background`: ejecuta con nohup y guarda logs.
@@ -153,19 +152,8 @@ piper agent "Inicializa un proyecto React (Vite) y correlo" --web --background -
   - `--dry-run`: muestra primero el plan en formato árbol y sale sin ejecutar nada.
   - `--web`, `--web-max`, `--web-timeout`: investiga en la web y usa ese contexto.
   - `--model` / `--fast`: elige el modelo.
+  - `--no-auto-web-assist`: desactiva la asistencia automática con web en comandos desconocidos o fallos (por defecto, activada).
 
-## Búsqueda de archivos en assist
-Por defecto, Piper puede buscar archivos en todo el sistema. Usa estas flags para controlar el alcance:
-- `--find-current-only`: limita la búsqueda al directorio actual.
-- `--find-base DIR`: define un directorio base específico.
-
-Ejemplos:
-
-```bash
-```bash
-piper "buscar archivo 'README.md'" --no-tts
-piper "buscar archivo 'piper_cli.py'" --find-current-only --no-tts
-piper "buscar archivo 'config.json'" --find-base ~/ --no-tts
 ```
 
 ```yaml
@@ -195,3 +183,23 @@ piper context --clear                # Limpia sólo el contexto (no la configura
 Integración:
 - `piper agent` consulta este contexto antes de preguntar por instalaciones; con `-y` instala sin preguntar.
 - `piper project` recuerda si aceptar o no aplicar `AI_NOTES.md` cuando no usas `--auto-apply-notes`.
+
+### Asistencia automática ante fallos o comandos desconocidos (nuevo)
+
+`piper agent` ahora te ayuda por defecto cuando:
+- El paso incluye un comando que no está en tu PATH: busca rápidamente en la web cómo usarlo e intenta sugerir alternativas (con el modelo) antes de ejecutar.
+- Un comando falla: hace una búsqueda con el error, resume 2–3 páginas y pide al modelo alternativas concretas; puedes elegir una y reintentar al momento.
+
+Control:
+- Desactiva este comportamiento con `--no-auto-web-assist`.
+- Sigue disponible `--web` para añadir contexto web al plan inicial (además de la asistencia automática en fallos).
+
+### Ayuda completa de Piper
+
+Para ver todas las flags y subcomandos con sus opciones detalladas en un solo listado:
+
+```bash
+piper -h
+# o
+piper --help
+```

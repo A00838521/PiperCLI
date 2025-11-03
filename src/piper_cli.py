@@ -36,6 +36,7 @@ from html.parser import HTMLParser
 from urllib.parse import urlparse, parse_qs, quote_plus, unquote
 import platform
 import socket
+import threading
 
 try:
     from piper_tts import speak  # noqa: F401
@@ -137,11 +138,99 @@ def _ascii_banner() -> str:
 
 _PHASE_STACK: list[tuple[str, float, int]] = []  # (name, start_ts, est)
 
+# -------------------- Spinner global ligero (indicador de actividad) --------------------
+_SPINNER_STATE = {
+    "thread": None,
+    "stop": None,
+    "paused": False,
+    "enabled": True,
+}
+
+
+def _spinner_enabled() -> bool:
+    if os.environ.get("PIPER_NO_SPINNER", "0").lower() in ("1", "true", "yes"):
+        return False
+    try:
+        return sys.stderr.isatty()
+    except Exception:
+        return False
+
+
+def _spinner_loop(stop_event: threading.Event) -> None:
+    symbols = ['⣾', '⣷', '⣯', '⣟', '⡿', '⢿', '⣻', '⣽']
+    i = 0
+    while not stop_event.is_set():
+        try:
+            if _SPINNER_STATE.get("paused") or not _SPINNER_STATE.get("enabled", True):
+                time.sleep(0.1)
+                continue
+            sym = symbols[i % len(symbols)]
+            i += 1
+            # Imprimir en stderr para no mezclar con stdout y mantenerlo pequeño
+            sys.stderr.write("\r" + sym + " ")
+            sys.stderr.flush()
+            time.sleep(0.12)
+        except Exception:
+            # Si algo falla, salir silenciosamente
+            break
+    # limpiar rastro del spinner
+    try:
+        sys.stderr.write("\r  \r")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _spinner_start() -> None:
+    if _SPINNER_STATE.get("thread") is not None:
+        return
+    _SPINNER_STATE["enabled"] = _spinner_enabled()
+    if not _SPINNER_STATE["enabled"]:
+        return
+    stop_event = threading.Event()
+    th = threading.Thread(target=_spinner_loop, args=(stop_event,), daemon=True)
+    _SPINNER_STATE["stop"] = stop_event
+    _SPINNER_STATE["thread"] = th
+    _SPINNER_STATE["paused"] = False
+    th.start()
+
+
+def _spinner_stop() -> None:
+    ev = _SPINNER_STATE.get("stop")
+    th = _SPINNER_STATE.get("thread")
+    _SPINNER_STATE["paused"] = True
+    if isinstance(ev, threading.Event):
+        ev.set()
+    if isinstance(th, threading.Thread):
+        try:
+            th.join(timeout=0.5)
+        except Exception:
+            pass
+    _SPINNER_STATE["thread"] = None
+    _SPINNER_STATE["stop"] = None
+
+
+def _spinner_pause() -> None:
+    _SPINNER_STATE["paused"] = True
+    # limpiar línea por si quedó el símbolo
+    try:
+        sys.stderr.write("\r  \r")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _spinner_resume() -> None:
+    if _SPINNER_STATE.get("thread") is not None:
+        _SPINNER_STATE["paused"] = False
+
 def progress_start(name: str, estimated_seconds: int | None = None) -> None:
     est = int(estimated_seconds or 0)
     _PHASE_STACK.append((name, time.time(), est))
     est_txt = f" ~{est}s" if est else ""
     print(f"⏳ {name}{est_txt}...")
+    # Asegurar spinner activo cuando hay fases en progreso
+    _spinner_start()
 
 
 def progress_end() -> None:
@@ -150,6 +239,9 @@ def progress_end() -> None:
     name, start, est = _PHASE_STACK.pop()
     dur = time.time() - start
     print(f"✓ {name} — {dur:.1f}s")
+    if not _PHASE_STACK:
+        # Dejamos el spinner activo globalmente, pero lo pausamos si no hay fases
+        _spinner_pause()
 
 
 def with_progress(name: str, est_seconds: int, func, *args, **kwargs):
@@ -288,10 +380,13 @@ class _UserCanceled(Exception):
 
 
 def _ask_input(prompt: str) -> str:
+    _spinner_pause()
     try:
         s = input(prompt)
     except EOFError:
         raise _UserCanceled()
+    finally:
+        _spinner_resume()
     if s is None:
         raise _UserCanceled()
     s2 = s.strip()
@@ -2188,6 +2283,46 @@ def _render_agent_tree(steps: list[dict], *, cwd: Path, background: bool) -> str
     return "\n".join(lines)
 
 
+def _first_token(cmd: str) -> str:
+    return (cmd.strip().split()[0] if cmd.strip() else "")
+
+
+def _is_known_command(token: str) -> bool:
+    if not token:
+        return False
+    builtins = {"bash", "sh", "cd", "mkdir", "echo", "ls", "pwd", "cp", "mv", "rm", "cat", "python", "python3"}
+    return token in builtins or _ensure_tool(token)
+
+
+def _agent_suggest_alternatives(cmd: str, error_text: str, model: str, os_info: str, prompt_context: str | None = None) -> dict:
+    """Pide al modelo alternativas de comando para resolver un fallo.
+    Forma: {"alternatives":[{"desc":"...","cmd":"..."}]}
+    Incluye el error y un resumen opcional de investigación web.
+    """
+    system = {
+        "role": "system",
+        "content": (
+            "Eres un asistente técnico. Dadas un comando y su error, sugiere alternativas concretas (1-3) con comandos shell exactos. "
+            "Devuelve SOLO JSON con la forma {\"alternatives\":[{\"desc\":\"...\",\"cmd\":\"...\"}]}."
+        ),
+    }
+    extra = f"\n\nContexto web:\n{prompt_context}\n" if prompt_context else ""
+    user = {"role": "user", "content": f"OS: {os_info}\nComando fallido: {cmd}\nError:\n{error_text}\n{extra}Devuelve solo JSON con alternativas."}
+    data = _ollama_chat_json([system, user], model)
+    if isinstance(data, dict) and isinstance(data.get("alternatives"), list):
+        return data
+    # Fallback: pedir de nuevo con ejemplo
+    user2 = {"role": "user", "content": (
+        f"OS: {os_info}\nComando: {cmd}\nError:\n{error_text}\n"
+        "Ejemplo de salida esperada: {\"alternatives\":[{\"desc\":\"instalar dependencia\",\"cmd\":\"brew install <tool>\"}]}\n"
+        "Ahora devuelve SOLO JSON con alternativas viables."
+    )}
+    data2 = _ollama_chat_json([system, user2], model)
+    if isinstance(data2, dict) and isinstance(data2.get("alternatives"), list):
+        return data2
+    return {"alternatives": []}
+
+
 def cmd_agent(args: argparse.Namespace) -> int:
     # Modelo
     if getattr(args, "fast", False):
@@ -2439,6 +2574,36 @@ def cmd_agent(args: argparse.Namespace) -> int:
         if not cmd:
             print(f"[SKIP] {desc}: no hay comando")
             continue
+        # Asistencia previa: si el comando parece desconocido y auto-web-assist está activo
+        if getattr(args, "auto_web_assist", True):
+            tok = _first_token(cmd)
+            if tok and not _is_known_command(tok):
+                print(f"[CTX] Comando no reconocido en PATH: '{tok}'. Buscando cómo ejecutarlo...")
+                try:
+                    q = f"how to use {tok} command macos"
+                    urls = search_web(q, max_results=int(getattr(args, "web_max", 5) or 5), timeout=float(getattr(args, "web_timeout", 15) or 15))
+                    web_ctx = research_urls(urls[:3]) if urls else ""
+                except Exception:
+                    web_ctx = ""
+                if web_ctx:
+                    print("[INFO] Sugerencias (resumen web):\n" + web_ctx[:1200] + ("..." if len(web_ctx) > 1200 else ""))
+                model2 = _ensure_model_available(_resolve_model(args.model))
+                alts = _agent_suggest_alternatives(cmd, "comando desconocido", model2, os_info, web_ctx)
+                alt_list = alts.get("alternatives", []) if isinstance(alts, dict) else []
+                if alt_list:
+                    print("[PLAN] Alternativas propuestas:")
+                    for j, a in enumerate(alt_list, 1):
+                        print(f" {j}. {a.get('desc','(sin desc)')}")
+                        print(f"    $ {a.get('cmd','')}")
+                    try:
+                        sel = _ask_input("¿Quieres intentar alguna alternativa? (número o ENTER para continuar con el original): ")
+                    except _UserCanceled:
+                        sel = ""
+                    if sel.strip().isdigit():
+                        k = int(sel.strip())
+                        if 1 <= k <= len(alt_list):
+                            cmd = alt_list[k-1].get("cmd") or cmd
+                            print(f"[USE] Usando alternativa seleccionada: $ {cmd}")
         print(f"\n[RUN] {desc}\n$ {cmd}")
         code, out = _run_shell(cmd, workdir, background=bool(getattr(args, "background", False)))
         if out:
@@ -2446,6 +2611,44 @@ def cmd_agent(args: argparse.Namespace) -> int:
         if code != 0:
             any_fail = True
             print(f"[FAIL] Comando salió con código {code}")
+            # Asistencia posterior a fallo
+            if getattr(args, "auto_web_assist", True):
+                print("[INFO] Buscando soluciones/alternativas en la web y con el modelo...")
+                web_ctx2 = ""
+                try:
+                    q2 = f"{_first_token(cmd)} error {str(out)[:60]} macos"
+                    urls2 = search_web(q2, max_results=int(getattr(args, "web_max", 5) or 5), timeout=float(getattr(args, "web_timeout", 15) or 15))
+                    web_ctx2 = research_urls(urls2[:3]) if urls2 else ""
+                except Exception:
+                    pass
+                model3 = _ensure_model_available(_resolve_model(args.model))
+                alts2 = _agent_suggest_alternatives(cmd, out[-800:] if isinstance(out, str) else str(out), model3, os_info, web_ctx2)
+                alt2_list = alts2.get("alternatives", []) if isinstance(alts2, dict) else []
+                if alt2_list:
+                    print("[PLAN] Alternativas:")
+                    for j, a in enumerate(alt2_list, 1):
+                        print(f" {j}. {a.get('desc','(sin desc)')}")
+                        print(f"    $ {a.get('cmd','')}")
+                    try:
+                        sel2 = _ask_input("¿Intentar una alternativa ahora? (número / ENTER para saltar / q() para abortar): ")
+                    except _UserCanceled:
+                        print("[CANCELADO] Operación interrumpida por el usuario.")
+                        return 130
+                    if sel2.strip().isdigit():
+                        k2 = int(sel2.strip())
+                        if 1 <= k2 <= len(alt2_list):
+                            alt_cmd = alt2_list[k2-1].get("cmd") or ""
+                            if alt_cmd:
+                                print(f"\n[RUN-ALT] {desc}\n$ {alt_cmd}")
+                                code2, out2 = _run_shell(alt_cmd, workdir, background=bool(getattr(args, "background", False)))
+                                if out2:
+                                    print(out2)
+                                if code2 == 0:
+                                    print("[OK] Alternativa ejecutada con éxito.")
+                                    any_fail = False
+                                    continue
+                                else:
+                                    print(f"[FAIL] Alternativa falló con código {code2}")
 
     # Actualizar contexto tras ejecución de pasos
     for t in ("git", "gh", "node", "npm", "python3", "go"):
@@ -2870,8 +3073,28 @@ def smoke_run(root: Path, stack: str, *, timeout: int = 5) -> tuple[bool, str]:
         return False, f"[WARN] Smoke run error: {e}"
 
 
+def _print_full_help(parser: argparse.ArgumentParser) -> None:
+    try:
+        print(parser.format_help())
+    except Exception:
+        pass
+    # Mostrar ayuda detallada para cada subcomando
+    try:
+        for action in parser._actions:  # type: ignore[attr-defined]
+            if isinstance(action, argparse._SubParsersAction):  # type: ignore[attr-defined]
+                for name, sp in action.choices.items():
+                    print("\n===", name, "===\n")
+                    try:
+                        print(sp.format_help())
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="piper", description="Piper CLI — prompt a proyecto")
+    p = argparse.ArgumentParser(prog="piper", description="Piper CLI — prompt a proyecto", add_help=False)
+    p.add_argument("-h", "--help", action="store_true", help="Muestra ayuda completa con todas las flags y subcomandos")
     sub = p.add_subparsers(dest="cmd")
 
     p_assist = sub.add_parser("assist", help="Asistente interactivo con aclaraciones")
@@ -2935,7 +3158,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_agent.add_argument("--web", action="store_true", help="Investiga en la web y usa ese contexto para planificar los comandos")
     p_agent.add_argument("--web-max", type=int, default=5, help="Máximo de sitios web a considerar (por defecto 5)")
     p_agent.add_argument("--web-timeout", type=int, default=15, help="Timeout por solicitud web en segundos (por defecto 15s)")
-    p_agent.set_defaults(func=cmd_agent)
+    p_agent.add_argument("--no-auto-web-assist", dest="auto_web_assist", action="store_false", help="Desactiva asistencia automática web (predeterminado: activada)")
+    p_agent.set_defaults(func=cmd_agent, auto_web_assist=True)
 
     # Servicio Ollama ON/OFF (acepta mayúsculas y minúsculas)
     p_on = sub.add_parser("on", help="Enciende el servicio Ollama")
@@ -3006,7 +3230,16 @@ def main(argv: list[str]) -> int:
         pass
     parser = build_parser()
     # Permitir modo "piper \"haz X\"" sin subcomando, tolerando flags desconocidas
+    # Activar spinner global (se pausará si hay input o no hay fases activas)
+    try:
+        _spinner_start()
+    except Exception:
+        pass
     args, extras = parser.parse_known_args(argv[1:])
+    if getattr(args, "help", False):
+        _print_full_help(parser)
+        _spinner_stop()
+        return 0
     if not getattr(args, "cmd", None):
         # Sin subcomando explícito -> asistente rápido
         default_prompt = getattr(args, "default_prompt", None) or (extras[0] if extras else (argv[1] if len(argv) > 1 else None))
@@ -3029,7 +3262,14 @@ def main(argv: list[str]) -> int:
             save=None,
             append=False,
         )
-        code = cmd_assist(ns)
+        code = 0
+        try:
+            code = cmd_assist(ns)
+        finally:
+            try:
+                _spinner_stop()
+            except Exception:
+                pass
         try:
             _ctx_record_run("assist-quick", {"prompt": default_prompt[:200]}, code, extra={})
         except Exception:
@@ -3051,6 +3291,10 @@ def main(argv: list[str]) -> int:
                 else:
                     summary[k] = str(v)[:120]
             _ctx_record_run(getattr(args, "cmd", "unknown"), summary, int(code), extra={})
+        except Exception:
+            pass
+        try:
+            _spinner_stop()
         except Exception:
             pass
     return code
