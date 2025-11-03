@@ -111,3 +111,26 @@ Esto elimina el wrapper y los archivos bajo `~/.local/share/piper-cli`. Puedes m
 ## Nota sobre TTS
 
 Piper CLI puede hablar si tienes un TTS local (por ejemplo, Piper TTS u otras voces). Usa `--no-tts` para silenciar. En macOS también puedes usar `piper say "Texto..."` si configuraste TTS compatible.
+
+## Agent (ejecutor de comandos)
+Describe una tarea y deja que Piper planifique y ejecute comandos shell. Puede investigar en la web y preguntar antes de instalar herramientas.
+
+```bash
+```bash
+piper agent "Crea carpeta demo y git init; inicializa React con Vite" --web --cwd ~/proyectos --no-tts
+```
+
+```
+
+- Flags de agent:
+  - `--cwd DIR` directorio de trabajo.
+  - `--background` ejecuta en segundo plano (logs en `~/.local/share/piper-cli/logs/`).
+  - `-y/--yes` omite confirmaciones (incluida la confirmación inicial del plan).
+  - `--dry-run` muestra el plan en formato árbol y termina sin ejecutar nada.
+  - `--web`, `--web-max`, `--web-timeout` usa investigación web como contexto.
+
+## Assist: búsqueda de archivos y TTS
+- Por defecto TTS está desactivado; actívalo con `PIPER_ENABLE_TTS=1` o usa `--no-tts` para silenciar.
+- Controla el alcance de búsqueda de archivos:
+  - `--find-current-only` limita al directorio actual.
+  - `--find-base DIR` fija un directorio base.

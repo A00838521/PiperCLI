@@ -3,10 +3,13 @@
 Asistente local de terminal que convierte prompts en proyectos y respuestas útiles, con integración a Ollama, investigación web opcional y TTS. Todo corre en tu equipo.
 
 ## Qué incluye
+
 - Asistente (`piper assist`):
-  - Respuesta guiada (formato JSON interno) para aclarar intenciones.
-  - Modo libre (`--freeform`) para respuesta de texto directa.
-  - Con investigación web (`--web`): busca y resume sitios, usa ideas como contexto (sin copiar código).
+
+   - Respuesta guiada (formato JSON interno) para aclarar intenciones.
+   - Modo libre (`--freeform`) para respuesta de texto directa.
+   - Con investigación web (`--web`): busca y resume sitios, usa ideas como contexto (sin copiar código).
+
 - Generación de proyectos (`piper project`): notas de IA, archivos sugeridos y verificación rápida (sintaxis/pruebas básicas).
 - Investigación web independiente (`piper research --url ...`).
 - Control de servicio Ollama (`piper on` / `piper off`).
@@ -15,6 +18,7 @@ Asistente local de terminal que convierte prompts en proyectos y respuestas úti
 ## Instalación
 
 ### Linux (ModeloARCH)
+
 - Instalador principal (delegado):
 
 ```bash
@@ -27,6 +31,7 @@ bash ModeloARCH/install_arch.sh
 - Asegura PATH (bash/zsh): añade `~/.local/bin` a tu rc (`~/.bashrc` o `~/.zshrc`).
 
 Opciones útiles en Linux:
+
 - `--no-systemd`: no configura servicio de usuario, usa fallback con `nohup`.
 - `--ensure-models lista`: predescarga modelos (p. ej. `mistral:7b-instruct,phi3:mini`).
 - `--restore TAR`: restaura backup generado por `backup_state.sh` (si lo conservaste).
@@ -46,12 +51,14 @@ bash ModeloMACOS/install_macos.sh
 ## Desinstalación
 
 - Linux:
+
 ```bash
 bash uninstall.sh           # o bash ModeloARCH/uninstall_arch.sh
 bash ModeloARCH/uninstall_arch.sh --stop-service   # detiene servicio y limpia más a fondo
 ```
 
 - macOS:
+
 ```bash
 bash ModeloMACOS/uninstall_macos.sh
 ```
@@ -59,43 +66,52 @@ bash ModeloMACOS/uninstall_macos.sh
 ## Uso básico
 
 - Asistente (silencioso):
+
 ```bash
 piper "Explica brevemente qué hace Piper" --no-tts
 ```
 
 - Modo libre tipo chat:
+
 ```bash
 piper assist "Genera un plan de pruebas para una API REST" --freeform --no-tts
 ```
 
 - Investigación web (sin copiar código):
+
 ```bash
 piper assist "Compara librerías de scraping en Python" --web --no-tts
 ```
 
 - Crear proyecto con IA y verificación rápida:
+
 ```bash
 piper project "API FastAPI con endpoint /salud" --ai --ai-files --auto-apply-notes --smoke-run
 ```
 
 ## Parámetros y configuración
+
 - Web: `--web-max`, `--web-timeout`, `--gen-estimate`.
 - Persistentes:
+
 ```bash
 piper config --show
 piper config --set-max-ai-bytes 83886080 --set-max-ai-file-bytes 8388608 --enable-smoke-python
 ```
+
 - Variables:
-  - `PIPER_OLLAMA_MODEL`: modelo por defecto (por ejemplo `mistral:7b-instruct`).
-  - `OLLAMA_HOST`: host de Ollama (por defecto `http://127.0.0.1:11434`).
+   - `PIPER_OLLAMA_MODEL`: modelo por defecto (por ejemplo `mistral:7b-instruct`).
+   - `OLLAMA_HOST`: host de Ollama (por defecto `http://127.0.0.1:11434`).
 
 ## Seguridad y límites
+
 - Validación estricta de rutas (solo relativas seguras dentro del proyecto).
 - Límites de tamaño totales y por archivo para contenido IA.
 - Sanitización de texto generado (remueve fences/backticks; evita binarios aparentes).
 - Investigación web: se usan ideas/temas; no se copian bloques de código de terceros.
 
 ## Estructura del repo
+
 - `src/`: código fuente del CLI (Python).
 - `install.sh` / `uninstall.sh`: wrappers de compatibilidad que delegan a ModeloARCH.
 - `ModeloARCH/`: scripts Linux (`install_arch.sh`, `uninstall_arch.sh`, README-arch.txt).
@@ -104,8 +120,78 @@ piper config --set-max-ai-bytes 83886080 --set-max-ai-file-bytes 8388608 --enabl
 - `state/`: configuración por defecto (`config.json`).
 
 ## Notas de modelos
+
 - Piper usa Ollama; por defecto intenta `mistral:7b-instruct`.
 - `--fast` fuerza `phi3:mini` para respuestas rápidas.
 
 ## Roadmap
+
 - Soporte Windows (futuro): planeado un modelo `ModeloWIN` con instaladores `.ps1` y servicio en segundo plano equivalente.
+
+## Agent (ejecutor de comandos)
+
+Permite describir una tarea en lenguaje natural y que Piper planifique y ejecute comandos shell (con confirmaciones sensibles). Usa tu sistema operativo como contexto y puede investigar en la web.
+
+```bash
+```bash
+piper agent "Crea una carpeta demo y git init" --cwd ~/proyectos --no-tts
+```
+
+```sh
+
+```bash
+```bash
+piper agent "Inicializa un proyecto React (Vite) y correlo" --web --background -y --no-tts
+```
+
+```md
+
+- Flags de agent:
+  - `--cwd DIR`: directorio de trabajo.
+  - `--background`: ejecuta con nohup y guarda logs.
+  - `-y/--yes`: omite confirmaciones (instalaciones y también la confirmación inicial del plan).
+  - `--dry-run`: muestra primero el plan en formato árbol y sale sin ejecutar nada.
+  - `--web`, `--web-max`, `--web-timeout`: investiga en la web y usa ese contexto.
+  - `--model` / `--fast`: elige el modelo.
+
+## Búsqueda de archivos en assist
+Por defecto, Piper puede buscar archivos en todo el sistema. Usa estas flags para controlar el alcance:
+- `--find-current-only`: limita la búsqueda al directorio actual.
+- `--find-base DIR`: define un directorio base específico.
+
+Ejemplos:
+
+```bash
+```bash
+piper "buscar archivo 'README.md'" --no-tts
+piper "buscar archivo 'piper_cli.py'" --find-current-only --no-tts
+piper "buscar archivo 'config.json'" --find-base ~/ --no-tts
+```
+
+```yaml
+
+## TTS (texto a voz)
+Por defecto, TTS está desactivado. Actívalo sólo si quieres que hable:
+- Exporta `PIPER_ENABLE_TTS=1` para habilitar por defecto.
+- Usa `--no-tts` para silenciar puntualmente.
+```
+
+## Contexto inteligente (nuevo)
+
+Piper mantiene un contexto persistente para evitar preguntas repetitivas y optimizar decisiones:
+
+- Herramientas rastreadas: `git`, `gh` (GitHub CLI), `node`, `npm`, `python3`, `go`.
+- Decisiones recordadas: por ejemplo, si aceptaste o rechazaste instalar `git` (`install.git`), o aplicar `AI_NOTES`.
+- Historial de ejecuciones: últimos 100 comandos con salida (exit code) y hora.
+
+Comandos útiles:
+
+```bash
+piper context --show                 # Ver estado actual (herramientas, decisiones, últimos runs)
+piper context --forget install.git   # Olvida una decisión puntual
+piper context --clear                # Limpia sólo el contexto (no la configuración)
+```
+
+Integración:
+- `piper agent` consulta este contexto antes de preguntar por instalaciones; con `-y` instala sin preguntar.
+- `piper project` recuerda si aceptar o no aplicar `AI_NOTES.md` cuando no usas `--auto-apply-notes`.

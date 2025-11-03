@@ -53,6 +53,7 @@ except Exception:
 ROOT = Path(__file__).resolve().parent
 AI_TOTAL_BYTES_DEFAULT = int(os.environ.get("PIPER_AI_TOTAL_BYTES_DEFAULT", str(20 * 1024 * 1024)))  # 20MB
 AI_FILE_BYTES_DEFAULT = int(os.environ.get("PIPER_AI_FILE_BYTES_DEFAULT", str(2 * 1024 * 1024)))    # 2MB
+_CTX: dict[str, Any] | None = None
 
 
 # -------------------- Utilidades --------------------
@@ -71,6 +72,15 @@ def mkdirp(p: Path) -> None:
 def write_file(path: Path, content: str) -> None:
     mkdirp(path.parent)
     path.write_text(content, encoding="utf-8")
+
+
+def _tts_on(_args: argparse.Namespace | None = None) -> bool:
+    """Control global de TTS por defecto desactivado.
+    Activa TTS sólo si PIPER_ENABLE_TTS=1/true/yes o si el caller lo pide explícitamente.
+    En cmd_assist también se requiere que no se pase --no-tts.
+    """
+    v = str(os.environ.get("PIPER_ENABLE_TTS", "0")).lower()
+    return v in ("1", "true", "yes")
 
 
 def _maybe_save_output(base: Path, save_path: str | None, content: str, *, append: bool = False) -> None:
@@ -176,6 +186,99 @@ def _dir_tree(root: Path, *, max_depth: int = 2, max_entries: int = 100) -> list
 
     walk(root, "", 0)
     return lines
+
+
+# -------------------- Contexto inteligente persistente --------------------
+
+def _load_context() -> dict:
+    global _CTX
+    if _CTX is not None:
+        return _CTX
+    cfg = get_config() or {}
+    ctx = cfg.get("context") or {}
+    if not isinstance(ctx, dict):
+        ctx = {}
+    # Estructura mínima
+    ctx.setdefault("version", 1)
+    ctx.setdefault("last_run_ts", None)
+    ctx.setdefault("runs", [])            # lista de últimos N runs
+    ctx.setdefault("tools", {})           # mapa nombre-> {installed: bool, last_checked_ts}
+    ctx.setdefault("decisions", {})       # decisiones del usuario (p.ej., instalar git: declined)
+    _CTX = ctx
+    return ctx
+
+
+def _save_context() -> None:
+    ctx = _load_context()
+    cfg = get_config() or {}
+    cfg["context"] = ctx
+    try:
+        save_config(cfg)
+    except Exception:
+        pass
+
+
+def _ctx_mark_tool(name: str, installed: bool) -> None:
+    ctx = _load_context()
+    tools = ctx.setdefault("tools", {})
+    entry = tools.setdefault(name, {})
+    entry["installed"] = bool(installed)
+    entry["last_checked_ts"] = datetime.now().isoformat(timespec="seconds")
+
+
+def _ctx_tool_installed(name: str) -> bool:
+    ctx = _load_context()
+    tools = ctx.get("tools", {})
+    entry = tools.get(name) or {}
+    return bool(entry.get("installed"))
+
+
+def _ctx_record_decision(key: str, value: str) -> None:
+    ctx = _load_context()
+    dec = ctx.setdefault("decisions", {})
+    dec[key] = value
+
+
+def _ctx_get_decision(key: str) -> str | None:
+    ctx = _load_context()
+    dec = ctx.get("decisions", {})
+    v = dec.get(key)
+    return v if isinstance(v, str) else None
+
+
+def _ctx_record_run(cmd: str, args_summary: dict, exit_code: int, extra: dict | None = None) -> None:
+    ctx = _load_context()
+    run = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "cmd": cmd,
+        "args": args_summary,
+        "exit": int(exit_code),
+    }
+    if extra:
+        run.update({k: v for k, v in extra.items() if k not in ("args", "exit", "cmd", "ts")})
+    runs: list = ctx.setdefault("runs", [])
+    runs.append(run)
+    # Mantener últimos 100
+    if len(runs) > 100:
+        del runs[: len(runs) - 100]
+    ctx["last_run_ts"] = run["ts"]
+    _save_context()
+
+
+def _ctx_refresh_tools_presence() -> None:
+    """Refresca presencia de herramientas comunes en PATH y actualiza contexto.
+    Herramientas: git, gh, node, npm, python3, go
+    """
+    tools = {
+        "git": _ensure_tool("git"),
+        "gh": _ensure_tool("gh"),
+        "node": _ensure_tool("node"),
+        "npm": _ensure_tool("npm"),
+        "python3": _ensure_tool("python3"),
+        "go": _ensure_tool("go"),
+    }
+    for name, present in tools.items():
+        _ctx_mark_tool(name, bool(present))
 
 
 # -------------------- Entrada interactiva con cancelación q() --------------------
@@ -1415,7 +1518,8 @@ def cmd_project(args: argparse.Namespace) -> int:
     dst, stack = create_project(args.prompt, args.name, base_dir)
     progress_end()
     print(f"[OK] Proyecto creado: {dst}  (stack: {stack})")
-    speak(os.environ.get("PIPER_ON_CREATE_MSG", "Proyecto creado"))
+    if _tts_on(None):
+        speak(os.environ.get("PIPER_ON_CREATE_MSG", "Proyecto creado"))
     # Investigación opcional por URL(s)
     research_md = ""
     if getattr(args, "research_url", None):
@@ -1544,11 +1648,17 @@ def cmd_project(args: argparse.Namespace) -> int:
         if notes_path.exists():
             proceed = auto_apply
             if not proceed:
-                try:
-                    apply_ans = _ask_input("¿Aplicar ahora las mejoras y pasos de AI_NOTES.md? (y/N): ").lower()
-                except _UserCanceled:
-                    apply_ans = ""
-                proceed = apply_ans in ("y", "s", "yes", "si")
+                # Consultar decisión previa en contexto
+                prior = _ctx_get_decision("apply.ai_notes")
+                if prior in ("accepted", "declined"):
+                    proceed = prior == "accepted"
+                else:
+                    try:
+                        apply_ans = _ask_input("¿Aplicar ahora las mejoras y pasos de AI_NOTES.md? (y/N): ").lower()
+                    except _UserCanceled:
+                        apply_ans = ""
+                    proceed = apply_ans in ("y", "s", "yes", "si")
+                    _ctx_record_decision("apply.ai_notes", "accepted" if proceed else "declined")
             if proceed:
                 try:
                     text = notes_path.read_text(encoding="utf-8")
@@ -1684,7 +1794,7 @@ def cmd_assist(args: argparse.Namespace) -> int:
     if _is_date_query(prompt0):
         text = _date_today_text()
         print(text)
-        if not args.no_tts:
+        if _tts_on(args) and not args.no_tts:
             speak(text)
         _maybe_save_output(Path.cwd(), getattr(args, "save", None), text, append=bool(getattr(args, "append", False)))
         return 0
@@ -1692,7 +1802,7 @@ def cmd_assist(args: argparse.Namespace) -> int:
     if _is_time_query(prompt0):
         text = _time_now_text()
         print(text)
-        if not args.no_tts:
+        if _tts_on(args) and not args.no_tts:
             speak(text)
         _maybe_save_output(Path.cwd(), getattr(args, "save", None), text, append=bool(getattr(args, "append", False)))
         return 0
@@ -1700,7 +1810,7 @@ def cmd_assist(args: argparse.Namespace) -> int:
     if _is_cwd_query(prompt0):
         text = _cwd_text()
         print(text)
-        if not args.no_tts:
+        if _tts_on(args) and not args.no_tts:
             speak(text)
         _maybe_save_output(Path.cwd(), getattr(args, "save", None), text, append=bool(getattr(args, "append", False)))
         return 0
@@ -1712,7 +1822,7 @@ def cmd_assist(args: argparse.Namespace) -> int:
         else:
             text = _get_local_ip()
         print(text)
-        if not args.no_tts:
+        if _tts_on(args) and not args.no_tts:
             speak(text)
         _maybe_save_output(Path.cwd(), getattr(args, "save", None), text, append=bool(getattr(args, "append", False)))
         return 0
@@ -1724,18 +1834,22 @@ def cmd_assist(args: argparse.Namespace) -> int:
             speak(text)
         _maybe_save_output(Path.cwd(), getattr(args, "save", None), text, append=bool(getattr(args, "append", False)))
         return 0
-    # Intento local: búsqueda de archivo dentro del directorio actual
+    # Intento local: búsqueda de archivo (por defecto, busca desde la raíz del sistema)
     if _is_find_file_query(prompt0):
         term = _extract_filename_term(prompt0)
         if not term:
             print("Indica el nombre del archivo, por ejemplo: buscar archivo \"README.md\"")
             return 2
-        base = Path.cwd()
+        if getattr(args, "find_current_only", False):
+            base = Path.cwd()
+        else:
+            fb = getattr(args, "find_base", None)
+            base = Path(fb).expanduser().resolve() if fb else Path("/")
         results = _search_files(term, base, max_results=20)
         if not results:
             text = f"No encontré '{term}' bajo {base}"
             print(text)
-            if not args.no_tts:
+            if _tts_on(args) and not args.no_tts:
                 speak(text)
             _maybe_save_output(base, getattr(args, "save", None), text, append=bool(getattr(args, "append", False)))
             return 0
@@ -1785,7 +1899,7 @@ def cmd_assist(args: argparse.Namespace) -> int:
         gen_est = int(getattr(args, "gen_estimate", 20) or 20)
         out_text = with_progress("Generando respuesta (modelo)", gen_est, _ollama_chat, [system, user_msg], model)
         print(out_text)
-        if not args.no_tts and out_text:
+        if _tts_on(args) and not args.no_tts and out_text:
             speak(out_text)
         _maybe_save_output(Path.cwd(), getattr(args, "save", None), out_text, append=bool(getattr(args, "append", False)))
         return 0
@@ -1817,7 +1931,7 @@ def cmd_assist(args: argparse.Namespace) -> int:
             gen_est = int(getattr(args, "gen_estimate", 20) or 20)
             out_text = with_progress("Generando respuesta (modelo)", gen_est, _ollama_chat, [system, user_msg], model0)
             print(out_text)
-            if not args.no_tts and out_text:
+            if _tts_on(args) and not args.no_tts and out_text:
                 speak(out_text)
             _maybe_save_output(Path.cwd(), getattr(args, "save", None), out_text, append=bool(getattr(args, "append", False)))
             return 0
@@ -1848,7 +1962,7 @@ def cmd_assist(args: argparse.Namespace) -> int:
         gen_est = int(getattr(args, "gen_estimate", 20) or 20)
         out_text = with_progress("Generando respuesta (modelo)", gen_est, _ollama_chat, messages, model)
         print(out_text)
-        if not args.no_tts and out_text:
+        if _tts_on(args) and not args.no_tts and out_text:
             speak(out_text)
         _maybe_save_output(Path.cwd(), getattr(args, "save", None), out_text, append=bool(getattr(args, "append", False)))
         return 0
@@ -1899,7 +2013,7 @@ def cmd_assist(args: argparse.Namespace) -> int:
             if _is_date_query(text):
                 ans = _date_today_text()
                 print(ans)
-                if not args.no_tts:
+                if _tts_on(args) and not args.no_tts:
                     speak(ans)
                 _maybe_save_output(Path.cwd(), getattr(args, "save", None), ans, append=bool(getattr(args, "append", False)))
                 return 0
@@ -1907,7 +2021,7 @@ def cmd_assist(args: argparse.Namespace) -> int:
             if _is_time_query(text):
                 ans = _time_now_text()
                 print(ans)
-                if not args.no_tts:
+                if _tts_on(args) and not args.no_tts:
                     speak(ans)
                 _maybe_save_output(Path.cwd(), getattr(args, "save", None), ans, append=bool(getattr(args, "append", False)))
                 return 0
@@ -1915,7 +2029,7 @@ def cmd_assist(args: argparse.Namespace) -> int:
             if _is_cwd_query(text):
                 ans = _cwd_text()
                 print(ans)
-                if not args.no_tts:
+                if _tts_on(args) and not args.no_tts:
                     speak(ans)
                 _maybe_save_output(Path.cwd(), getattr(args, "save", None), ans, append=bool(getattr(args, "append", False)))
                 return 0
@@ -1939,7 +2053,7 @@ def cmd_assist(args: argparse.Namespace) -> int:
             if _is_date_query(answer):
                 ans = _date_today_text()
                 print(ans)
-                if not args.no_tts:
+                if _tts_on(args) and not args.no_tts:
                     speak(ans)
                 _maybe_save_output(Path.cwd(), getattr(args, "save", None), ans, append=bool(getattr(args, "append", False)))
                 return 0
@@ -1971,13 +2085,13 @@ def cmd_assist(args: argparse.Namespace) -> int:
             continue
         elif t == "answer":
             print(text)
-            if not args.no_tts:
+            if _tts_on(args) and not args.no_tts:
                 speak(text)
             _maybe_save_output(Path.cwd(), getattr(args, "save", None), text, append=bool(getattr(args, "append", False)))
             return 0
         else:
             print(text)
-            if not args.no_tts and text:
+            if _tts_on(args) and not args.no_tts and text:
                 speak(text)
             _maybe_save_output(Path.cwd(), getattr(args, "save", None), text, append=bool(getattr(args, "append", False)))
             return 0
@@ -1986,6 +2100,365 @@ def cmd_assist(args: argparse.Namespace) -> int:
 def cmd_say(args: argparse.Namespace) -> int:
     said = speak(args.text)
     return 0 if said else 1
+
+
+def _ensure_tool(cmd: str) -> bool:
+    return shutil.which(cmd) is not None
+
+
+def _agent_logs_dir() -> Path:
+    p = _ollama_logs_dir().parent  # ~/.local/share/piper-cli
+    mkdirp(p / "logs")
+    return p / "logs"
+
+
+def _agent_plan(prompt: str, model: str, os_info: str, web_context: str | None = None) -> dict:
+    """Pide al modelo un plan JSON de pasos con comandos shell seguros.
+    Forma esperada: {"steps":[{"desc":"...","cmd":"..."}, ...]}
+    """
+    system = {
+        "role": "system",
+        "content": (
+            "Eres un agente que traduce una instrucción de alto nivel en pasos concretos con comandos shell. "
+            "Entorno: " + os_info + ". "
+            "Devuelve SOLO JSON válido con la forma {\"steps\":[{\"desc\":\"...\",\"cmd\":\"...\"}]}. "
+            "Usa comandos estándar. Evita destructivos como rm -rf sin confirmación."
+        ),
+    }
+    extra = f"\n\nCONTEXTO WEB:\n{web_context}\n" if web_context else ""
+    user = {"role": "user", "content": f"Tarea: {prompt}{extra}\nDevuelve solo JSON con los pasos y comandos."}
+    data = _ollama_chat_json([system, user], model)
+    if isinstance(data, dict) and isinstance(data.get("steps"), list):
+        return data
+    # Fallback sencillo: pedir de nuevo con ejemplo
+    user2 = {"role": "user", "content": (
+        f"Tarea: {prompt}\n"
+        "Forma exacta: {\"steps\":[{\"desc\":\"crear carpeta\",\"cmd\":\"mkdir -p nueva\"}]}\n"
+        "Devuelve solo JSON."
+    )}
+    data2 = _ollama_chat_json([system, user2], model)
+    if isinstance(data2, dict) and isinstance(data2.get("steps"), list):
+        return data2
+    return {"steps": []}
+
+
+def _run_shell(cmd: str, cwd: Path, background: bool) -> tuple[int, str]:
+    cwd = cwd.resolve()
+    if background:
+        logdir = _agent_logs_dir()
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        log = logdir / f"agent-{ts}.log"
+        # nohup background
+        full = f"nohup bash -lc {json.dumps(cmd)} >>{json.dumps(str(log))} 2>&1 &"
+        code = os.system(full)
+        return (0 if code == 0 else 1), f"[BG] {cmd}\nLogs: {log}"
+    try:
+        proc = subprocess.run(["bash", "-lc", cmd], cwd=str(cwd), capture_output=True, text=True)
+        out = (proc.stdout or "") + (proc.stderr or "")
+        return proc.returncode, out.strip()
+    except Exception as e:
+        return 1, f"Error al ejecutar: {e}"
+
+
+def _render_agent_tree(steps: list[dict], *, cwd: Path, background: bool) -> str:
+    """Devuelve una representación en árbol del plan del agente.
+    Estructura:
+    Agent plan (N pasos)
+    └── Ejecutará en: <cwd> (foreground|background)
+        ├── 1. <desc>
+        │   └── $ <cmd>
+        └── ...
+    """
+    lines: list[str] = []
+    n = len(steps)
+    mode = "background" if background else "foreground"
+    lines.append(f"Agent plan ({n} paso{'s' if n != 1 else ''})")
+    lines.append(f"└── Ejecutará en: {str(cwd)} ({mode})")
+    if not steps:
+        return "\n".join(lines)
+    for idx, st in enumerate(steps, 1):
+        is_last = (idx == n)
+        branch = "└── " if is_last else "├── "
+        subpref = "    " if is_last else "│   "
+        desc = st.get("desc", "(sin desc)")
+        cmd = st.get("cmd", "")
+        lines.append(f"{subpref}{branch}{idx}. {desc}")
+        if cmd:
+            lines.append(f"{subpref}    └── $ {cmd}")
+    return "\n".join(lines)
+
+
+def cmd_agent(args: argparse.Namespace) -> int:
+    # Modelo
+    if getattr(args, "fast", False):
+        args.model = "phi3:mini"
+    model = _ensure_model_available(_resolve_model(args.model))
+    # Contexto OS
+    os_info = _os_info_text().replace("\n", "; ")
+    # CWD para ejecución
+    workdir = Path(args.cwd).expanduser().resolve() if getattr(args, "cwd", None) else Path.cwd()
+    # Contexto web opcional
+    web_ctx = None
+    if getattr(args, "web", False):
+        try:
+            urls = with_progress("Buscando sitios en la web", 6, search_web, args.prompt, max_results=int(getattr(args, "web_max", 5) or 5), timeout=float(getattr(args, "web_timeout", 15) or 15))
+        except Exception:
+            urls = []
+        if not urls:
+            try:
+                urls = with_progress("Sugerencias de sitios (modelo)", 8, llm_suggest_urls, args.prompt, model, count=int(getattr(args, "web_max", 5) or 5))
+            except Exception:
+                urls = []
+        if urls:
+            try:
+                est = min(5 * len(urls[: int(getattr(args, "web_max", 5) or 5)]), 25)
+                web_ctx = with_progress("Investigación web (resumen)", est, research_urls, urls[: int(getattr(args, "web_max", 5) or 5)], timeout=float(getattr(args, "web_timeout", 15) or 15))
+            except Exception:
+                web_ctx = None
+    # Obtener plan
+    plan = with_progress("Planificando con modelo", 8, _agent_plan, args.prompt, model, os_info, web_ctx)
+    steps = plan.get("steps", []) if isinstance(plan, dict) else []
+    if not steps:
+        print("[ERROR] El modelo no devolvió un plan ejecutable.")
+        return 1
+
+    # Mostrar plan como árbol y confirmar
+    tree = _render_agent_tree(steps, cwd=workdir, background=bool(getattr(args, "background", False)))
+    print("\n" + tree + "\n")
+
+    if getattr(args, "dry_run", False):
+        print("[DRY-RUN] Vista previa del plan mostrada. No se ejecutó ningún comando.")
+        return 0
+    if not getattr(args, "yes", False):
+        try:
+            ans = _ask_input("¿Deseas proceder con la ejecución de estos comandos? (y/N): ").lower()
+        except _UserCanceled:
+            ans = ""
+        if ans not in ("y", "s", "yes", "si"):
+            print("[CANCELADO] Ejecución abortada por el usuario.")
+            return 130
+
+    # Verificar herramientas clave según plan
+    # Necesidades de herramientas y contexto
+    need_git = any("git" in (st.get("cmd") or "") for st in steps)
+    need_gh = any((st.get("cmd") or "").strip().startswith("gh ") or " gh " in (st.get("cmd") or " ") for st in steps)
+    need_node = any((st.get("cmd") or "").strip().startswith("node ") or " node " in (st.get("cmd") or " ") for st in steps)
+    need_npm = any((st.get("cmd") or "").strip().startswith("npm ") or " npm " in (st.get("cmd") or " ") for st in steps)
+    need_go = any((st.get("cmd") or "").strip().startswith("go ") or " go " in (st.get("cmd") or " ") for st in steps)
+    need_py = any(
+        (st.get("cmd") or "").strip().startswith("python3 ") or " python3 " in (st.get("cmd") or " ") or " pip " in (st.get("cmd") or " ")
+        for st in steps
+    )
+
+    # Marcar estado actual al contexto (detección rápida)
+    for t in ("git", "gh", "node", "npm", "python3", "go"):
+        _ctx_mark_tool(t, _ensure_tool(t))
+
+    # Git
+    if need_git and not _ensure_tool("git"):
+        # Consultar contexto antes de preguntar
+        if _ctx_tool_installed("git"):
+            print("[CTX] Contexto indica que 'git' está instalado previamente. Continuando sin instalar.")
+        else:
+            prior = _ctx_get_decision("install.git")
+            consent: bool
+            if getattr(args, "yes", False):
+                print("[CTX] Usando -y: se procederá sin preguntar a instalar 'git'.")
+                consent = True
+                _ctx_record_decision("install.git", "accepted")
+            elif prior == "declined":
+                print("[CTX] Recordada decisión previa: install.git=declined; no se preguntará.")
+                consent = False
+            elif prior == "accepted":
+                print("[CTX] Recordada decisión previa: install.git=accepted; se procederá sin preguntar.")
+                consent = True
+            elif prior == "declined":
+                print("[CTX] Se había rechazado instalar 'git' anteriormente. Omitiendo prompt.")
+                consent = False
+            else:
+                try:
+                    ans = _ask_input("No se encontró 'git'. ¿Deseas instalarlo con Homebrew? (y/N): ").lower()
+                except _UserCanceled:
+                    ans = ""
+                consent = ans in ("y", "s", "yes", "si")
+                _ctx_record_decision("install.git", "accepted" if consent else "declined")
+            if consent:
+                print("[INFO] Instalando git via brew...")
+                code, out = _run_shell("brew install git", workdir, background=False)
+                print(out)
+                if code == 0 and _ensure_tool("git"):
+                    _ctx_mark_tool("git", True)
+                if code != 0:
+                    print("[WARN] No se pudo instalar git automáticamente.")
+            else:
+                print("[INFO] Omitiendo instalación de git.")
+
+    # GitHub CLI (gh)
+    if need_gh and not _ensure_tool("gh"):
+        if _ctx_tool_installed("gh"):
+            print("[CTX] Contexto indica que 'gh' está instalado previamente. Continuando sin instalar.")
+        else:
+            prior = _ctx_get_decision("install.gh")
+            consent: bool
+            if getattr(args, "yes", False):
+                print("[CTX] Usando -y: se procederá sin preguntar a instalar 'gh'.")
+                consent = True
+                _ctx_record_decision("install.gh", "accepted")
+            elif prior == "declined":
+                print("[CTX] Recordada decisión previa: install.gh=declined; no se preguntará.")
+                consent = False
+            elif prior == "accepted":
+                print("[CTX] Recordada decisión previa: install.gh=accepted; se procederá sin preguntar.")
+                consent = True
+            else:
+                try:
+                    ans = _ask_input("No se encontró 'gh' (GitHub CLI). ¿Instalar con Homebrew? (y/N): ").lower()
+                except _UserCanceled:
+                    ans = ""
+                consent = ans in ("y", "s", "yes", "si")
+                _ctx_record_decision("install.gh", "accepted" if consent else "declined")
+            if consent:
+                print("[INFO] Instalando gh via brew...")
+                code, out = _run_shell("brew install gh", workdir, background=False)
+                print(out)
+                if code == 0 and _ensure_tool("gh"):
+                    _ctx_mark_tool("gh", True)
+                if code != 0:
+                    print("[WARN] No se pudo instalar gh automáticamente.")
+            else:
+                print("[INFO] Omitiendo instalación de gh.")
+
+    # Node.js / npm
+    if (need_node or need_npm) and not _ensure_tool("node"):
+        if _ctx_tool_installed("node"):
+            print("[CTX] Contexto indica que 'node' está instalado previamente. Continuando.")
+        else:
+            prior = _ctx_get_decision("install.node")
+            if getattr(args, "yes", False):
+                print("[CTX] Usando -y: se procederá sin preguntar a instalar 'node'.")
+                consent = True
+                _ctx_record_decision("install.node", "accepted")
+            elif prior == "declined":
+                print("[CTX] Recordada decisión previa: install.node=declined; no se preguntará.")
+                consent = False
+            elif prior == "accepted":
+                print("[CTX] Recordada decisión previa: install.node=accepted; se procederá sin preguntar.")
+                consent = True
+            else:
+                try:
+                    ans = _ask_input("No se encontró 'node'. ¿Instalar con Homebrew? (y/N): ").lower()
+                except _UserCanceled:
+                    ans = ""
+                consent = ans in ("y", "s", "yes", "si")
+                _ctx_record_decision("install.node", "accepted" if consent else "declined")
+            if consent:
+                print("[INFO] Instalando node via brew...")
+                code, out = _run_shell("brew install node", workdir, background=False)
+                print(out)
+                if code == 0 and _ensure_tool("node"):
+                    _ctx_mark_tool("node", True)
+                    _ctx_mark_tool("npm", _ensure_tool("npm"))
+                if code != 0:
+                    print("[WARN] No se pudo instalar node automáticamente.")
+            else:
+                print("[INFO] Omitiendo instalación de node.")
+
+    # Go
+    if need_go and not _ensure_tool("go"):
+        if _ctx_tool_installed("go"):
+            print("[CTX] Contexto indica que 'go' está instalado previamente. Continuando.")
+        else:
+            prior = _ctx_get_decision("install.go")
+            if getattr(args, "yes", False):
+                print("[CTX] Usando -y: se procederá sin preguntar a instalar 'go'.")
+                consent = True
+                _ctx_record_decision("install.go", "accepted")
+            elif prior == "declined":
+                print("[CTX] Recordada decisión previa: install.go=declined; no se preguntará.")
+                consent = False
+            elif prior == "accepted":
+                print("[CTX] Recordada decisión previa: install.go=accepted; se procederá sin preguntar.")
+                consent = True
+            else:
+                try:
+                    ans = _ask_input("No se encontró 'go'. ¿Instalar con Homebrew? (y/N): ").lower()
+                except _UserCanceled:
+                    ans = ""
+                consent = ans in ("y", "s", "yes", "si")
+                _ctx_record_decision("install.go", "accepted" if consent else "declined")
+            if consent:
+                print("[INFO] Instalando go via brew...")
+                code, out = _run_shell("brew install go", workdir, background=False)
+                print(out)
+                if code == 0 and _ensure_tool("go"):
+                    _ctx_mark_tool("go", True)
+                if code != 0:
+                    print("[WARN] No se pudo instalar go automáticamente.")
+            else:
+                print("[INFO] Omitiendo instalación de go.")
+
+    # Python3
+    if need_py and not _ensure_tool("python3"):
+        if _ctx_tool_installed("python3"):
+            print("[CTX] Contexto indica que 'python3' está instalado previamente. Continuando.")
+        else:
+            prior = _ctx_get_decision("install.python3")
+            if getattr(args, "yes", False):
+                print("[CTX] Usando -y: se procederá sin preguntar a instalar 'python3'.")
+                consent = True
+                _ctx_record_decision("install.python3", "accepted")
+            elif prior == "declined":
+                print("[CTX] Recordada decisión previa: install.python3=declined; no se preguntará.")
+                consent = False
+            elif prior == "accepted":
+                print("[CTX] Recordada decisión previa: install.python3=accepted; se procederá sin preguntar.")
+                consent = True
+            else:
+                try:
+                    ans = _ask_input("No se encontró 'python3'. ¿Instalar con Homebrew? (y/N): ").lower()
+                except _UserCanceled:
+                    ans = ""
+                consent = ans in ("y", "s", "yes", "si")
+                _ctx_record_decision("install.python3", "accepted" if consent else "declined")
+            if consent:
+                print("[INFO] Instalando python3 via brew...")
+                code, out = _run_shell("brew install python", workdir, background=False)
+                print(out)
+                if code == 0 and _ensure_tool("python3"):
+                    _ctx_mark_tool("python3", True)
+                if code != 0:
+                    print("[WARN] No se pudo instalar python3 automáticamente.")
+            else:
+                print("[INFO] Omitiendo instalación de python3.")
+
+    # Ejecutar pasos
+    any_fail = False
+    for i, st in enumerate(steps, 1):
+        desc = st.get("desc") or f"paso {i}"
+        cmd = st.get("cmd") or ""
+        if not cmd:
+            print(f"[SKIP] {desc}: no hay comando")
+            continue
+        print(f"\n[RUN] {desc}\n$ {cmd}")
+        code, out = _run_shell(cmd, workdir, background=bool(getattr(args, "background", False)))
+        if out:
+            print(out)
+        if code != 0:
+            any_fail = True
+            print(f"[FAIL] Comando salió con código {code}")
+
+    # Actualizar contexto tras ejecución de pasos
+    for t in ("git", "gh", "node", "npm", "python3", "go"):
+        _ctx_mark_tool(t, _ensure_tool(t))
+    _save_context()
+
+    if any_fail:
+        print("\n[WARN] Uno o más comandos fallaron. Revisa la salida anterior.")
+        _ctx_record_run("agent", {"prompt": args.prompt[:200], "cwd": str(workdir)}, 1, extra={"background": bool(getattr(args, "background", False))})
+        return 1
+    print("\n[OK] Agent completó los pasos.")
+    _ctx_record_run("agent", {"prompt": args.prompt[:200], "cwd": str(workdir)}, 0, extra={"background": bool(getattr(args, "background", False))})
+    return 0
 
 
 def cmd_service_on(_args: argparse.Namespace) -> int:
@@ -2144,6 +2617,76 @@ def cmd_config(args: argparse.Namespace) -> int:
         print(f"max_ai_bytes: {d.get('max_ai_bytes', AI_TOTAL_BYTES_DEFAULT)}")
         print(f"max_ai_file_bytes: {d.get('max_ai_file_bytes', AI_FILE_BYTES_DEFAULT)}")
         print(f"smoke_python_default: {d.get('smoke_python_default', True)}")
+    return 0
+
+
+def _format_context(ctx: dict) -> str:
+    lines: list[str] = []
+    lines.append("[CONTEXT]")
+    lines.append(f"version: {ctx.get('version')}")
+    lines.append(f"last_run_ts: {ctx.get('last_run_ts')}")
+    # Tools
+    tools = ctx.get("tools", {}) or {}
+    if isinstance(tools, dict) and tools:
+        lines.append("tools:")
+        for name, meta in sorted(tools.items()):
+            if isinstance(meta, dict):
+                inst = meta.get("installed")
+                ts = meta.get("last_checked_ts")
+                lines.append(f"  - {name}: installed={bool(inst)} last_checked={ts}")
+            else:
+                lines.append(f"  - {name}: {meta}")
+    # Decisions
+    dec = ctx.get("decisions", {}) or {}
+    if isinstance(dec, dict) and dec:
+        lines.append("decisions:")
+        for k, v in sorted(dec.items()):
+            lines.append(f"  - {k}: {v}")
+    # Runs
+    runs = ctx.get("runs", []) or []
+    lines.append(f"runs: {len(runs)} (most recent last)")
+    for r in runs[-5:]:  # mostrar últimos 5
+        try:
+            lines.append(f"  - {r.get('ts')} :: {r.get('cmd')} exit={r.get('exit')}")
+        except Exception:
+            continue
+    return "\n".join(lines)
+
+
+def cmd_context(args: argparse.Namespace) -> int:
+    ctx = _load_context()
+    changed = False
+    if getattr(args, "clear", False):
+        # Reiniciar a estructura mínima
+        ctx.clear()
+        ctx.update({
+            "version": 1,
+            "last_run_ts": None,
+            "runs": [],
+            "tools": {},
+            "decisions": {},
+        })
+        changed = True
+        print("[OK] Contexto limpiado")
+    forget = getattr(args, "forget", None)
+    if forget:
+        dec = ctx.setdefault("decisions", {})
+        if forget in dec:
+            dec.pop(forget, None)
+            changed = True
+            print(f"[OK] Olvidada decisión: {forget}")
+        else:
+            print(f"[INFO] No existía decisión: {forget}")
+    if changed:
+        _save_context()
+    if getattr(args, "show", False) or (not getattr(args, "clear", False) and not forget):
+        # Refrescar presencia de herramientas antes de mostrar
+        try:
+            _ctx_refresh_tools_presence()
+            _save_context()
+        except Exception:
+            pass
+        print(_format_context(_load_context()))
     return 0
 
 
@@ -2335,15 +2878,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_assist.add_argument("prompt", help="Petición inicial")
     p_assist.add_argument("--model", help="Modelo Ollama (por defecto PIPER_OLLAMA_MODEL o mistral:7b-instruct)")
     p_assist.add_argument("--fast", action="store_true", help="Usar modelo rápido (phi3:mini) en esta ejecución")
-    p_assist.add_argument("--no-tts", action="store_true", help="Desactiva TTS al responder")
+    p_assist.add_argument("--no-tts", action="store_true", help="Desactiva TTS al responder (por defecto TTS está desactivado)")
     p_assist.add_argument("--freeform", action="store_true", help="Modo estilo chat: respuesta libre de texto (sin JSON)")
     p_assist.add_argument("--web", action="store_true", help="Usa resumen web de URLs del prompt como contexto para la respuesta")
     p_assist.add_argument("--web-max", type=int, default=5, help="Máximo de sitios web a considerar (por defecto 5)")
     p_assist.add_argument("--web-timeout", type=int, default=15, help="Timeout por solicitud web en segundos (por defecto 15s)")
     p_assist.add_argument("--gen-estimate", type=int, default=20, help="Tiempo estimado (s) mostrado para la fase de generación")
+    # Búsqueda de archivos (por defecto buscará en todo el sistema si aplica el intent)
+    p_assist.add_argument("--find-base", help="Directorio base para búsqueda de archivos (default: /)")
+    p_assist.add_argument("--find-current-only", action="store_true", help="Limita la búsqueda de archivos al directorio actual")
     p_assist.add_argument("--save", help="Guardar la salida en un archivo relativo (p. ej. 'notas.md')")
     p_assist.add_argument("--append", action="store_true", help="Anexar en vez de sobrescribir al usar --save")
-    p_assist.set_defaults(func=cmd_assist)
+    p_assist.set_defaults(func=cmd_assist, no_tts=True)
 
     p_project = sub.add_parser("project", help="Genera un proyecto")
     p_project.add_argument("prompt", help="Descripción del proyecto")
@@ -2374,6 +2920,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_say = sub.add_parser("say", help="Decir un texto con Piper TTS")
     p_say.add_argument("text")
     p_say.set_defaults(func=cmd_say)
+
+    # Agente de ejecución de comandos
+    p_agent = sub.add_parser("agent", help="Agente que infiere y ejecuta comandos a partir de una instrucción")
+    p_agent.add_argument("prompt", help="Instrucción de alto nivel (qué hacer)")
+    p_agent.add_argument("--model", help="Modelo Ollama a usar para planificar (por defecto heurístico)")
+    p_agent.add_argument("--fast", action="store_true", help="Usar modelo rápido (phi3:mini) en esta ejecución")
+    p_agent.add_argument("--no-tts", action="store_true", help="Desactiva TTS al responder (por defecto desactivado)")
+    p_agent.add_argument("--cwd", help="Directorio de trabajo para ejecutar los comandos (por defecto: cwd)")
+    p_agent.add_argument("--background", action="store_true", help="Ejecuta los comandos en background y guarda logs")
+    p_agent.add_argument("-y", "--yes", action="store_true", help="No preguntar confirmaciones (instalaciones u operaciones sensibles)")
+    p_agent.add_argument("--dry-run", action="store_true", help="Mostrar el plan en formato árbol y salir sin ejecutar nada")
+    # Web como contexto previo a la planificación
+    p_agent.add_argument("--web", action="store_true", help="Investiga en la web y usa ese contexto para planificar los comandos")
+    p_agent.add_argument("--web-max", type=int, default=5, help="Máximo de sitios web a considerar (por defecto 5)")
+    p_agent.add_argument("--web-timeout", type=int, default=15, help="Timeout por solicitud web en segundos (por defecto 15s)")
+    p_agent.set_defaults(func=cmd_agent)
 
     # Servicio Ollama ON/OFF (acepta mayúsculas y minúsculas)
     p_on = sub.add_parser("on", help="Enciende el servicio Ollama")
@@ -2417,6 +2979,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_conf.add_argument("--disable-smoke-python", action="store_true", help="Desactiva smoke run por defecto en stack 'python'")
     p_conf.set_defaults(func=cmd_config)
 
+    # Contexto inteligente: mostrar/limpiar/olvidar
+    p_ctx = sub.add_parser("context", help="Gestiona el contexto inteligente (herramientas, decisiones, historial)")
+    p_ctx.add_argument("--show", action="store_true", help="Muestra el contexto actual")
+    p_ctx.add_argument("--clear", action="store_true", help="Limpia el contexto (mantiene otras configuraciones)")
+    p_ctx.add_argument("--forget", help="Olvida una decisión (clave), p. ej. install.git")
+    p_ctx.set_defaults(func=cmd_context)
+
     # Positional opcional sólo si no hay subcomando
     p.add_argument("default_prompt", nargs="?", help=argparse.SUPPRESS)
     return p
@@ -2429,6 +2998,12 @@ def main(argv: list[str]) -> int:
             print(_ascii_banner())
         except Exception:
             pass
+    # Cargar contexto al inicio de cualquier ejecución
+    try:
+        _load_context()
+        _ctx_refresh_tools_presence()
+    except Exception:
+        pass
     parser = build_parser()
     # Permitir modo "piper \"haz X\"" sin subcomando, tolerando flags desconocidas
     args, extras = parser.parse_known_args(argv[1:])
@@ -2443,17 +3018,42 @@ def main(argv: list[str]) -> int:
         ns = argparse.Namespace(
             prompt=default_prompt,
             model=None,
-            no_tts=no_tts,
+            no_tts=True if no_tts or True else False,
             web=False,
             freeform=False,
             web_max=5,
             web_timeout=15,
             gen_estimate=20,
+            find_base=None,
+            find_current_only=False,
             save=None,
             append=False,
         )
-        return cmd_assist(ns)
-    return args.func(args)
+        code = cmd_assist(ns)
+        try:
+            _ctx_record_run("assist-quick", {"prompt": default_prompt[:200]}, code, extra={})
+        except Exception:
+            pass
+        return code
+    # Ejecutar subcomando y registrar en contexto
+    code = 0
+    try:
+        code = args.func(args)
+    finally:
+        try:
+            # Resumen compacto de args (evitar objetos no serializables o largos)
+            summary: dict[str, Any] = {}
+            for k, v in vars(args).items():
+                if k in ("func",):
+                    continue
+                if isinstance(v, (str, int, float, bool, type(None))):
+                    summary[k] = v if not (isinstance(v, str) and len(v) > 200) else v[:200]
+                else:
+                    summary[k] = str(v)[:120]
+            _ctx_record_run(getattr(args, "cmd", "unknown"), summary, int(code), extra={})
+        except Exception:
+            pass
+    return code
 
 
 if __name__ == "__main__":
