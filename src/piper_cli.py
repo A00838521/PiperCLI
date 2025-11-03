@@ -2237,7 +2237,7 @@ def _agent_plan(prompt: str, model: str, os_info: str, web_context: str | None =
     return {"steps": []}
 
 
-def _run_shell(cmd: str, cwd: Path, background: bool) -> tuple[int, str]:
+def _run_shell(cmd: str, cwd: Path, background: bool, *, stream: bool = True) -> tuple[int, str]:
     cwd = cwd.resolve()
     if background:
         logdir = _agent_logs_dir()
@@ -2248,9 +2248,18 @@ def _run_shell(cmd: str, cwd: Path, background: bool) -> tuple[int, str]:
         code = os.system(full)
         return (0 if code == 0 else 1), f"[BG] {cmd}\nLogs: {log}"
     try:
-        proc = subprocess.run(["bash", "-lc", cmd], cwd=str(cwd), capture_output=True, text=True)
-        out = (proc.stdout or "") + (proc.stderr or "")
-        return proc.returncode, out.strip()
+        if stream:
+            # Adjuntar IO al TTY para permitir interacción en vivo
+            _spinner_pause()
+            try:
+                code = subprocess.call(["bash", "-lc", cmd], cwd=str(cwd))
+            finally:
+                _spinner_resume()
+            return int(code), ""
+        else:
+            proc = subprocess.run(["bash", "-lc", cmd], cwd=str(cwd), capture_output=True, text=True)
+            out = (proc.stdout or "") + (proc.stderr or "")
+            return proc.returncode, out.strip()
     except Exception as e:
         return 1, f"Error al ejecutar: {e}"
 
@@ -2419,7 +2428,7 @@ def cmd_agent(args: argparse.Namespace) -> int:
                 _ctx_record_decision("install.git", "accepted" if consent else "declined")
             if consent:
                 print("[INFO] Instalando git via brew...")
-                code, out = _run_shell("brew install git", workdir, background=False)
+                code, out = _run_shell("brew install git", workdir, background=False, stream=bool(getattr(args, "stream", True)))
                 print(out)
                 if code == 0 and _ensure_tool("git"):
                     _ctx_mark_tool("git", True)
@@ -2454,7 +2463,7 @@ def cmd_agent(args: argparse.Namespace) -> int:
                 _ctx_record_decision("install.gh", "accepted" if consent else "declined")
             if consent:
                 print("[INFO] Instalando gh via brew...")
-                code, out = _run_shell("brew install gh", workdir, background=False)
+                code, out = _run_shell("brew install gh", workdir, background=False, stream=bool(getattr(args, "stream", True)))
                 print(out)
                 if code == 0 and _ensure_tool("gh"):
                     _ctx_mark_tool("gh", True)
@@ -2488,7 +2497,7 @@ def cmd_agent(args: argparse.Namespace) -> int:
                 _ctx_record_decision("install.node", "accepted" if consent else "declined")
             if consent:
                 print("[INFO] Instalando node via brew...")
-                code, out = _run_shell("brew install node", workdir, background=False)
+                code, out = _run_shell("brew install node", workdir, background=False, stream=bool(getattr(args, "stream", True)))
                 print(out)
                 if code == 0 and _ensure_tool("node"):
                     _ctx_mark_tool("node", True)
@@ -2523,7 +2532,7 @@ def cmd_agent(args: argparse.Namespace) -> int:
                 _ctx_record_decision("install.go", "accepted" if consent else "declined")
             if consent:
                 print("[INFO] Instalando go via brew...")
-                code, out = _run_shell("brew install go", workdir, background=False)
+                code, out = _run_shell("brew install go", workdir, background=False, stream=bool(getattr(args, "stream", True)))
                 print(out)
                 if code == 0 and _ensure_tool("go"):
                     _ctx_mark_tool("go", True)
@@ -2557,7 +2566,7 @@ def cmd_agent(args: argparse.Namespace) -> int:
                 _ctx_record_decision("install.python3", "accepted" if consent else "declined")
             if consent:
                 print("[INFO] Instalando python3 via brew...")
-                code, out = _run_shell("brew install python", workdir, background=False)
+                code, out = _run_shell("brew install python", workdir, background=False, stream=bool(getattr(args, "stream", True)))
                 print(out)
                 if code == 0 and _ensure_tool("python3"):
                     _ctx_mark_tool("python3", True)
@@ -2605,7 +2614,12 @@ def cmd_agent(args: argparse.Namespace) -> int:
                             cmd = alt_list[k-1].get("cmd") or cmd
                             print(f"[USE] Usando alternativa seleccionada: $ {cmd}")
         print(f"\n[RUN] {desc}\n$ {cmd}")
-        code, out = _run_shell(cmd, workdir, background=bool(getattr(args, "background", False)))
+        code, out = _run_shell(
+            cmd,
+            workdir,
+            background=bool(getattr(args, "background", False)),
+            stream=bool(getattr(args, "stream", True)),
+        )
         if out:
             print(out)
         if code != 0:
@@ -2640,7 +2654,12 @@ def cmd_agent(args: argparse.Namespace) -> int:
                             alt_cmd = alt2_list[k2-1].get("cmd") or ""
                             if alt_cmd:
                                 print(f"\n[RUN-ALT] {desc}\n$ {alt_cmd}")
-                                code2, out2 = _run_shell(alt_cmd, workdir, background=bool(getattr(args, "background", False)))
+                                code2, out2 = _run_shell(
+                                    alt_cmd,
+                                    workdir,
+                                    background=bool(getattr(args, "background", False)),
+                                    stream=bool(getattr(args, "stream", True)),
+                                )
                                 if out2:
                                     print(out2)
                                 if code2 == 0:
@@ -3153,13 +3172,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_agent.add_argument("--cwd", help="Directorio de trabajo para ejecutar los comandos (por defecto: cwd)")
     p_agent.add_argument("--background", action="store_true", help="Ejecuta los comandos en background y guarda logs")
     p_agent.add_argument("-y", "--yes", action="store_true", help="No preguntar confirmaciones (instalaciones u operaciones sensibles)")
+    p_agent.add_argument("--no-stream", dest="stream", action="store_false", help="No adjuntar IO; captura salida y muéstrala al final (por defecto: streaming on)")
     p_agent.add_argument("--dry-run", action="store_true", help="Mostrar el plan en formato árbol y salir sin ejecutar nada")
     # Web como contexto previo a la planificación
     p_agent.add_argument("--web", action="store_true", help="Investiga en la web y usa ese contexto para planificar los comandos")
     p_agent.add_argument("--web-max", type=int, default=5, help="Máximo de sitios web a considerar (por defecto 5)")
     p_agent.add_argument("--web-timeout", type=int, default=15, help="Timeout por solicitud web en segundos (por defecto 15s)")
     p_agent.add_argument("--no-auto-web-assist", dest="auto_web_assist", action="store_false", help="Desactiva asistencia automática web (predeterminado: activada)")
-    p_agent.set_defaults(func=cmd_agent, auto_web_assist=True)
+    p_agent.set_defaults(func=cmd_agent, auto_web_assist=True, stream=True)
 
     # Servicio Ollama ON/OFF (acepta mayúsculas y minúsculas)
     p_on = sub.add_parser("on", help="Enciende el servicio Ollama")

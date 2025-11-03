@@ -153,6 +153,7 @@ piper agent "Inicializa un proyecto React (Vite) y correlo" --web --background -
   - `--web`, `--web-max`, `--web-timeout`: investiga en la web y usa ese contexto.
   - `--model` / `--fast`: elige el modelo.
   - `--no-auto-web-assist`: desactiva la asistencia automática con web en comandos desconocidos o fallos (por defecto, activada).
+  - `--no-stream`: no adjunta IO; captura y muestra al final (por defecto, streaming ON para ver e interactuar en tiempo real).
 
 ```
 
