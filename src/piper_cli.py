@@ -2293,7 +2293,40 @@ def _render_agent_tree(steps: list[dict], *, cwd: Path, background: bool) -> str
 
 
 def _first_token(cmd: str) -> str:
-    return (cmd.strip().split()[0] if cmd.strip() else "")
+    """Extrae el primer comando ejecutable del string shell.
+    - Ignora asignaciones (var=...)
+    - Si usa sustitución $(), intenta extraer el comando interno
+    - Usa shlex para tokenizar cuando sea posible
+    """
+    s = cmd.strip()
+    if not s:
+        return ""
+    # Detectar asignación al inicio: var=... o export VAR=...
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", s) or s.startswith("export "):
+        # Intentar capturar comando dentro de $()
+        m = re.search(r"\$\(([^\s)]+)", s)
+        if m:
+            return m.group(1)
+        # Como fallback, buscar después del primer espacio
+        parts = s.split(None, 1)
+        if len(parts) == 2:
+            return _first_token(parts[1])
+        return ""
+    # Backticks `cmd`
+    m2 = re.search(r"`([^\s`]+)", s)
+    if m2:
+        return m2.group(1)
+    # $() sustitución
+    m3 = re.search(r"\$\(([^\s)]+)", s)
+    if m3:
+        return m3.group(1)
+    # shlex tokenización básica
+    try:
+        import shlex
+        toks = shlex.split(s)
+        return toks[0] if toks else ""
+    except Exception:
+        return s.split()[0]
 
 
 def _is_known_command(token: str) -> bool:
@@ -2303,7 +2336,68 @@ def _is_known_command(token: str) -> bool:
     return token in builtins or _ensure_tool(token)
 
 
-def _agent_suggest_alternatives(cmd: str, error_text: str, model: str, os_info: str, prompt_context: str | None = None) -> dict:
+def _build_allowed_commands(steps: list[dict]) -> set[str]:
+    allowed = {
+        "bash", "sh", "echo", "cd", "mkdir", "rm", "cp", "mv", "ls", "pwd",
+        "pgrep", "ps", "pkill", "kill", "lsof", "grep", "awk", "sed", "find",
+        "npm", "npx", "yarn", "pnpm", "node", "vue", "vite",
+        "git", "gh", "brew", "python", "python3",
+    }
+    for st in steps:
+        c = st.get("cmd") or ""
+        tok = _first_token(c)
+        if tok:
+            allowed.add(tok)
+    return allowed
+
+
+def _ollama_chat_json_quick(messages: List[Dict[str, Any]], model: str, *, timeout: float = 30.0) -> Dict[str, Any]:
+    """Variante rápida de _ollama_chat_json con timeout configurable y una sola ruta preferente.
+    Intenta primero /v1/chat/completions con response_format json_object y luego /api/chat con format=json.
+    """
+    host = _ollama_host()
+    # Intento OpenAI compatible
+    v1_chat_url = f"{host}/v1/chat/completions"
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.2,
+        "stream": False,
+        "response_format": {"type": "json_object"},
+    }
+    try:
+        obj = _post_json(v1_chat_url, payload, timeout=timeout)
+        choices = obj.get("choices") or []
+        if choices:
+            msg = choices[0].get("message") or {}
+            content = (msg.get("content") or "").strip()
+            parsed = _extract_json_from_text(content)
+            if parsed is not None:
+                return parsed
+    except Exception:
+        pass
+    # Fallback Ollama /api/chat format=json
+    chat_url = f"{host}/api/chat"
+    payload2 = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "format": "json",
+        "options": {"temperature": 0.2, "num_ctx": 4096},
+    }
+    try:
+        obj2 = _post_json(chat_url, payload2, timeout=timeout)
+        msg = obj2.get("message") or {}
+        content = (msg.get("content") or obj2.get("response") or "").strip()
+        parsed = _extract_json_from_text(content)
+        if parsed is not None:
+            return parsed
+    except Exception:
+        pass
+    return {}
+
+
+def _agent_suggest_alternatives(cmd: str, error_text: str, model: str, os_info: str, prompt_context: str | None = None, *, goal: str | None = None, allowed: set[str] | None = None, timeout: float = 30.0) -> dict:
     """Pide al modelo alternativas de comando para resolver un fallo.
     Forma: {"alternatives":[{"desc":"...","cmd":"..."}]}
     Incluye el error y un resumen opcional de investigación web.
@@ -2311,13 +2405,18 @@ def _agent_suggest_alternatives(cmd: str, error_text: str, model: str, os_info: 
     system = {
         "role": "system",
         "content": (
-            "Eres un asistente técnico. Dadas un comando y su error, sugiere alternativas concretas (1-3) con comandos shell exactos. "
-            "Devuelve SOLO JSON con la forma {\"alternatives\":[{\"desc\":\"...\",\"cmd\":\"...\"}]}."
+            "Eres un asistente técnico estricto. Dado un comando fallido, sugiere de 1 a 3 alternativas DIRECTAMENTE relevantes, "
+            "con comandos shell exactos y seguros. NO propongas abrir sitios, apps gráficas ni comandos ajenos al contexto. "
+            "Mantente en el objetivo y el sistema operativo. Devuelve SOLO JSON válido: {\"alternatives\":[{\"desc\":\"...\",\"cmd\":\"...\"}]}."
         ),
     }
+    policy = ""
+    if allowed:
+        policy = "\nComandos permitidos prioritarios: " + ", ".join(sorted(list(allowed))[:20]) + "."
+    goal_line = f"\nObjetivo: {goal}" if goal else ""
     extra = f"\n\nContexto web:\n{prompt_context}\n" if prompt_context else ""
-    user = {"role": "user", "content": f"OS: {os_info}\nComando fallido: {cmd}\nError:\n{error_text}\n{extra}Devuelve solo JSON con alternativas."}
-    data = _ollama_chat_json([system, user], model)
+    user = {"role": "user", "content": f"OS: {os_info}{goal_line}\nComando fallido: {cmd}\nError:\n{error_text}{policy}{extra}\nResponde SOLO con el JSON solicitado."}
+    data = _ollama_chat_json_quick([system, user], model, timeout=timeout)
     if isinstance(data, dict) and isinstance(data.get("alternatives"), list):
         return data
     # Fallback: pedir de nuevo con ejemplo
@@ -2326,10 +2425,31 @@ def _agent_suggest_alternatives(cmd: str, error_text: str, model: str, os_info: 
         "Ejemplo de salida esperada: {\"alternatives\":[{\"desc\":\"instalar dependencia\",\"cmd\":\"brew install <tool>\"}]}\n"
         "Ahora devuelve SOLO JSON con alternativas viables."
     )}
-    data2 = _ollama_chat_json([system, user2], model)
+    data2 = _ollama_chat_json_quick([system, user2], model, timeout=timeout)
     if isinstance(data2, dict) and isinstance(data2.get("alternatives"), list):
-        return data2
-    return {"alternatives": []}
+        out = data2
+    else:
+        out = {"alternatives": []}
+    # Filtrado: mantener alternativas que respeten allowed y que no abran navegadores o comandos ajenos
+    alts_in = out.get("alternatives", []) if isinstance(out, dict) else []
+    alts_out = []
+    for a in alts_in:
+        if not isinstance(a, dict):
+            continue
+        c = (a.get("cmd") or "").strip()
+        if not c:
+            continue
+        tok = _first_token(c)
+        if allowed and tok and tok not in allowed:
+            continue
+        # Bloquear 'open http', 'say', u otros que no sean shell útil
+        low = c.lower()
+        if low.startswith("open http") or low.startswith("open https") or low.startswith("say "):
+            continue
+        alts_out.append(a)
+        if len(alts_out) >= 3:
+            break
+    return {"alternatives": alts_out}
 
 
 def cmd_agent(args: argparse.Namespace) -> int:
@@ -2577,6 +2697,8 @@ def cmd_agent(args: argparse.Namespace) -> int:
 
     # Ejecutar pasos
     any_fail = False
+    allowed_cmds = _build_allowed_commands(steps)
+    assist_timeout = int(getattr(args, "assist_timeout", 30) or 30)
     for i, st in enumerate(steps, 1):
         desc = st.get("desc") or f"paso {i}"
         cmd = st.get("cmd") or ""
@@ -2597,7 +2719,8 @@ def cmd_agent(args: argparse.Namespace) -> int:
                 if web_ctx:
                     print("[INFO] Sugerencias (resumen web):\n" + web_ctx[:1200] + ("..." if len(web_ctx) > 1200 else ""))
                 model2 = _ensure_model_available(_resolve_model(args.model))
-                alts = _agent_suggest_alternatives(cmd, "comando desconocido", model2, os_info, web_ctx)
+                print(f"[INFO] Consultando modelo por alternativas (máx {assist_timeout}s)...")
+                alts = _agent_suggest_alternatives(cmd, "comando desconocido", model2, os_info, web_ctx, goal=args.prompt, allowed=allowed_cmds, timeout=assist_timeout)
                 alt_list = alts.get("alternatives", []) if isinstance(alts, dict) else []
                 if alt_list:
                     print("[PLAN] Alternativas propuestas:")
@@ -2605,7 +2728,7 @@ def cmd_agent(args: argparse.Namespace) -> int:
                         print(f" {j}. {a.get('desc','(sin desc)')}")
                         print(f"    $ {a.get('cmd','')}")
                     try:
-                        sel = _ask_input("¿Quieres intentar alguna alternativa? (número o ENTER para continuar con el original): ")
+                        sel = _ask_input("¿Intentar una alternativa? (número / ENTER para continuar / q() para abortar): ")
                     except _UserCanceled:
                         sel = ""
                     if sel.strip().isdigit():
@@ -2613,6 +2736,8 @@ def cmd_agent(args: argparse.Namespace) -> int:
                         if 1 <= k <= len(alt_list):
                             cmd = alt_list[k-1].get("cmd") or cmd
                             print(f"[USE] Usando alternativa seleccionada: $ {cmd}")
+                else:
+                    print("[INFO] No se encontraron alternativas relevantes o expiró el tiempo.")
         print(f"\n[RUN] {desc}\n$ {cmd}")
         code, out = _run_shell(
             cmd,
@@ -2636,7 +2761,8 @@ def cmd_agent(args: argparse.Namespace) -> int:
                 except Exception:
                     pass
                 model3 = _ensure_model_available(_resolve_model(args.model))
-                alts2 = _agent_suggest_alternatives(cmd, out[-800:] if isinstance(out, str) else str(out), model3, os_info, web_ctx2)
+                print(f"[INFO] Consultando modelo por alternativas (máx {assist_timeout}s)...")
+                alts2 = _agent_suggest_alternatives(cmd, out[-800:] if isinstance(out, str) else str(out), model3, os_info, web_ctx2, goal=args.prompt, allowed=allowed_cmds, timeout=assist_timeout)
                 alt2_list = alts2.get("alternatives", []) if isinstance(alts2, dict) else []
                 if alt2_list:
                     print("[PLAN] Alternativas:")
@@ -2668,6 +2794,8 @@ def cmd_agent(args: argparse.Namespace) -> int:
                                     continue
                                 else:
                                     print(f"[FAIL] Alternativa falló con código {code2}")
+                else:
+                    print("[INFO] No se encontraron alternativas relevantes o expiró el tiempo.")
 
     # Actualizar contexto tras ejecución de pasos
     for t in ("git", "gh", "node", "npm", "python3", "go"):
@@ -3174,6 +3302,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_agent.add_argument("-y", "--yes", action="store_true", help="No preguntar confirmaciones (instalaciones u operaciones sensibles)")
     p_agent.add_argument("--no-stream", dest="stream", action="store_false", help="No adjuntar IO; captura salida y muéstrala al final (por defecto: streaming on)")
     p_agent.add_argument("--dry-run", action="store_true", help="Mostrar el plan en formato árbol y salir sin ejecutar nada")
+    p_agent.add_argument("--assist-timeout", type=int, default=30, help="Tiempo máx (s) para pedir alternativas al modelo (por defecto 30s)")
     # Web como contexto previo a la planificación
     p_agent.add_argument("--web", action="store_true", help="Investiga en la web y usa ese contexto para planificar los comandos")
     p_agent.add_argument("--web-max", type=int, default=5, help="Máximo de sitios web a considerar (por defecto 5)")
