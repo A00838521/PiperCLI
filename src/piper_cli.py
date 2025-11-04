@@ -853,6 +853,10 @@ def _is_macos() -> bool:
     return platform.system() == "Darwin"
 
 
+def _is_windows() -> bool:
+    return platform.system() == "Windows"
+
+
 def _exists(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
@@ -881,6 +885,27 @@ def start_ollama_service() -> tuple[bool, str]:
             cmd = f"nohup sh -c 'OLLAMA_HOST=127.0.0.1:11434 ollama serve >>\"{log}\" 2>&1' &"
             os.system(cmd)
             return True, "ollama serve lanzado en background (nohup)"
+        elif _is_windows():
+            # Windows: lanzar proceso en background con flags de detach
+            log = _ollama_logs_dir() / "ollama.out.log"
+            mkdirp(log.parent)
+            try:
+                DETACHED_PROCESS = 0x00000008
+                CREATE_NEW_PROCESS_GROUP = 0x00000200
+            except Exception:
+                DETACHED_PROCESS = 0
+                CREATE_NEW_PROCESS_GROUP = 0
+            try:
+                with open(log, "ab", buffering=0) as fh:
+                    proc = subprocess.Popen(
+                        ["ollama", "serve"],
+                        stdout=fh,
+                        stderr=fh,
+                        creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,  # type: ignore[attr-defined]
+                    )
+                return True, f"ollama serve lanzado en background (pid {proc.pid})"
+            except Exception as e:
+                return False, f"No se pudo iniciar ollama en Windows: {e}"
         else:
             # Linux
             if _exists("systemctl"):
@@ -909,6 +934,21 @@ def stop_ollama_service() -> tuple[bool, str]:
                 subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
             subprocess.run(["pkill", "-f", "ollama serve"], capture_output=True)
             return True, "ollama detenido"
+        elif _is_windows():
+            # Intentar detener proceso ollama.exe con taskkill
+            out = []
+            try:
+                p = subprocess.run(["taskkill", "/F", "/IM", "ollama.exe"], capture_output=True, text=True)
+                out.append(p.stdout or p.stderr or "")
+            except Exception:
+                pass
+            # Fallback: PowerShell Stop-Process
+            try:
+                p2 = subprocess.run(["powershell", "-NoProfile", "-Command", "Get-Process ollama -ErrorAction SilentlyContinue | Stop-Process -Force"], capture_output=True, text=True)
+                out.append(p2.stdout or p2.stderr or "")
+            except Exception:
+                pass
+            return True, "; ".join([s.strip() for s in out if s.strip()]) or "ollama detenido"
         else:
             if _exists("systemctl"):
                 proc = subprocess.run(["systemctl", "--user", "stop", "ollama.service"], capture_output=True, text=True)

@@ -71,6 +71,8 @@ run "printf '%s\n' \
 '#!/usr/bin/env bash' \
 'set -euo pipefail' \
 'PY=\${PYTHON:-python3}' \
+'SRC_DIR=\"$PIPER_HOME/src\"' \
+'export PYTHONPATH=\"$SRC_DIR\${PYTHONPATH:+:$PYTHONPATH}\"' \
 'exec \"\$PY\" \"$PIPER_HOME/src/piper_cli.py\" \"\$@\"' \
 > '$PIPER_WRAPPER'"
 run "chmod +x '$PIPER_WRAPPER'"
@@ -95,10 +97,16 @@ if brew services info ollama >/dev/null 2>&1; then
   run "brew services start ollama || true"
 else
   # Fallback: launchd plist de usuario
-  say "[WARN] brew services no disponible; creando LaunchAgent de usuario para Ollama"
+  say "[WARN] brew services no disponible; instalando LaunchAgent desde plantilla del repo"
   run "mkdir -p '$LAUNCH_AGENTS'"
   PLIST="$LAUNCH_AGENTS/com.piper.ollama.plist"
-  run "bash -c 'cat >\''$PLIST'\'' <<\"PL\n<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key><string>com.piper.ollama</string>\n  <key>ProgramArguments</key>\n  <array>\n    <string>ollama</string>\n    <string>serve</string>\n  </array>\n  <key>EnvironmentVariables</key>\n  <dict>\n    <key>OLLAMA_HOST</key><string>127.0.0.1:11434</string>\n  </dict>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n  <key>StandardOutPath</key><string>$PIPER_HOME/logs/ollama.out.log</string>\n  <key>StandardErrorPath</key><string>$PIPER_HOME/logs/ollama.err.log</string>\n</dict>\n</plist>\nPL\n'"
+  if [[ -f "$REPO_ROOT/ModeloMACOS/launchd/ollama.plist" ]]; then
+    # Sustituir ${HOME} por la ruta absoluta del usuario para rutas de log seguras
+    run "sed 's#\\${HOME}#'$HOME'#g' \"$REPO_ROOT/ModeloMACOS/launchd/ollama.plist\" > \"$PLIST\""
+  else
+    # Respaldo: generar un plist mínimo
+    run "bash -c 'cat >\''$PLIST'\'' <<\"PL\n<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key><string>com.piper.ollama</string>\n  <key>ProgramArguments</key>\n  <array>\n    <string>ollama</string>\n    <string>serve</string>\n  </array>\n  <key>EnvironmentVariables</key>\n  <dict>\n    <key>OLLAMA_HOST</key><string>127.0.0.1:11434</string>\n  </dict>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n  <key>StandardOutPath</key><string>$PIPER_HOME/logs/ollama.out.log</string>\n  <key>StandardErrorPath</key><string>$PIPER_HOME/logs/ollama.err.log</string>\n</dict>\n</plist>\nPL\n'"
+  fi
   run "launchctl unload '$PLIST' 2>/dev/null || true"
   run "launchctl load -w '$PLIST' || true"
 fi
