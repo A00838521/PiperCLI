@@ -67,14 +67,20 @@ run "mkdir -p '$PIPER_HOME/src' '$BIN_HOME' '$PIPER_HOME/logs' '$PIPER_STATE_DIR
 run "cp -r '$REPO_ROOT/src/'* '$PIPER_HOME/src/'"
 
 # Instalar wrapper (script ejecutable que llama a piper_cli.py) evitando expansiones prematuras
-run "printf '%s\n' \
-'#!/usr/bin/env bash' \
-'set -euo pipefail' \
-'PY=\${PYTHON:-python3}' \
-'SRC_DIR=\"$PIPER_HOME/src\"' \
-'export PYTHONPATH=\"$SRC_DIR\${PYTHONPATH:+:$PYTHONPATH}\"' \
-'exec \"\$PY\" \"$PIPER_HOME/src/piper_cli.py\" \"\$@\"' \
-> '$PIPER_WRAPPER'"
+if [[ "$DRY_RUN" = 1 ]]; then
+  say "[DRY_RUN] Generaría wrapper en $PIPER_WRAPPER"
+else
+  # Usamos heredoc sin comillas en el delimitador para expandir $PIPER_HOME aquí,
+  # pero escapamos $ en variables que deben quedar literales dentro del wrapper.
+  cat > "$PIPER_WRAPPER" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+PY=\${PYTHON:-python3}
+SRC_DIR="$PIPER_HOME/src"
+export PYTHONPATH="\$SRC_DIR\${PYTHONPATH:+:\$PYTHONPATH}"
+exec "\$PY" "$PIPER_HOME/src/piper_cli.py" "\$@"
+EOF
+fi
 run "chmod +x '$PIPER_WRAPPER'"
 
 # Asegurar que ~/.local/bin está en PATH (zsh por defecto)

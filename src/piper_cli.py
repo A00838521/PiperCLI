@@ -16,6 +16,10 @@ Ejemplos:
 """
 from __future__ import annotations
 import argparse
+import getpass
+import hashlib
+import secrets
+import base64
 import os
 import re
 import sys
@@ -308,6 +312,99 @@ def _save_context() -> None:
         save_config(cfg)
     except Exception:
         pass
+
+
+# -------------------- Seguridad (CTF y API key) --------------------
+
+def _security_section() -> dict:
+    cfg = get_config() or {}
+    sec = cfg.get("security")
+    if not isinstance(sec, dict):
+        sec = {}
+    return sec
+
+
+def _security_save(sec: dict) -> None:
+    cfg = get_config() or {}
+    cfg["security"] = sec
+    try:
+        save_config(cfg)
+    except Exception:
+        pass
+
+
+def _get_server_api_key() -> str | None:
+    sec = _security_section()
+    key = sec.get("server_api_key")
+    return key if isinstance(key, str) and key.strip() else None
+
+
+def _set_server_api_key(val: str | None) -> None:
+    sec = _security_section()
+    if val:
+        sec["server_api_key"] = str(val).strip()
+    else:
+        if "server_api_key" in sec:
+            sec.pop("server_api_key", None)
+    _security_save(sec)
+
+
+def _ctf_secret_record() -> dict | None:
+    sec = _security_section()
+    rec = sec.get("ctf_secret")
+    return rec if isinstance(rec, dict) else None
+
+
+def _ctf_set_secret(secret: str) -> None:
+    salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), salt, 200_000)
+    rec = {
+        "algo": "pbkdf2_sha256",
+        "salt_b64": base64.b64encode(salt).decode("ascii"),
+        "hash_hex": dk.hex(),
+        "iters": 200_000,
+    }
+    sec = _security_section()
+    sec["ctf_secret"] = rec
+    _security_save(sec)
+
+
+def _ctf_check_secret(secret: str) -> bool:
+    rec = _ctf_secret_record()
+    if not rec or (rec.get("algo") != "pbkdf2_sha256"):
+        return False
+    try:
+        salt = base64.b64decode(rec.get("salt_b64") or "")
+        iters = int(rec.get("iters") or 200_000)
+        target = (rec.get("hash_hex") or "").lower()
+        dk = hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), salt, iters)
+        return dk.hex().lower() == target
+    except Exception:
+        return False
+
+
+def _ctf_require_secret(provided: str | None = None) -> bool:
+    """Devuelve True si la clave proporcionada o solicitada es válida.
+    Busca en: argumento, env PIPER_CTF_KEY, prompt interactivo (getpass)."""
+    if _ctf_secret_record() is None:
+        print("[ERROR] CTF no está habilitado. Define una clave con: piper ctf set-key")
+        return False
+    secret = (provided or os.environ.get("PIPER_CTF_KEY") or "").strip()
+    if not secret:
+        try:
+            _spinner_pause()
+            secret = getpass.getpass("Clave CTF: ")
+        except Exception:
+            secret = ""
+        finally:
+            _spinner_resume()
+    if not secret:
+        print("[ERROR] No se proporcionó clave CTF")
+        return False
+    if not _ctf_check_secret(secret):
+        print("[ERROR] Clave CTF inválida")
+        return False
+    return True
 
 
 def _ctx_mark_tool(name: str, installed: bool) -> None:
@@ -983,9 +1080,46 @@ class _PiperHTTPHandler:
             # muy simple: solo GET /ping y /ask?prompt=
             first = req.splitlines()[0] if req else ""
             path = first.split(" ")[1] if len(first.split(" ")) >= 2 else "/"
+            # parse headers mínimos
+            headers_in: dict[str, str] = {}
+            try:
+                lines = req.split("\r\n")
+                for ln in lines[1:]:
+                    if not ln:
+                        break
+                    if ":" in ln:
+                        k, v = ln.split(":", 1)
+                        headers_in[k.strip().lower()] = v.strip()
+            except Exception:
+                pass
             status = "200 OK"
             body = "{}"
             headers = "Content-Type: application/json\r\n"
+            # Enforce API key si está configurada
+            api_key = _get_server_api_key()
+            if api_key:
+                # aceptar X-API-Key header o query ?key=
+                provided = headers_in.get("x-api-key")
+                if not provided:
+                    try:
+                        from urllib.parse import parse_qs, urlparse
+                        q = parse_qs(urlparse(path).query)
+                        provided = (q.get("key", [""])[0] or "").strip()
+                    except Exception:
+                        provided = ""
+                if provided != api_key:
+                    status = "401 Unauthorized"
+                    body = json.dumps({"ok": False, "error": "invalid api key"})
+                    resp = (
+                        f"HTTP/1.1 {status}\r\n"
+                        + headers
+                        + f"Content-Length: {len(body.encode('utf-8'))}\r\n"
+                        + "Connection: close\r\n\r\n"
+                        + body
+                    )
+                    self.writer.write(resp.encode("utf-8"))
+                    await self.writer.drain()
+                    return
             if path.startswith("/ping"):
                 body = json.dumps({"ok": True, "ts": datetime.now().isoformat(timespec="seconds")})
             elif path.startswith("/ask"):
@@ -2825,6 +2959,691 @@ def cmd_service_off(_args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+# -------------------- CTF MODE (pro) --------------------
+
+def _ctf_tools_status() -> dict[str, bool]:
+    tools = [
+        "sqlmap", "gobuster", "hydra", "nmap", "nikto", "whatweb", "ffuf", "binwalk", "strings"
+    ]
+    return {t: _ensure_tool(t) for t in tools}
+
+
+# Recetas de instalación por herramienta y gestor de paquetes
+_CTF_INSTALL_RECIPES: dict[str, dict[str, list[str]]] = {
+    # Básicas de recon/web
+    "sqlmap": {
+        "brew": ["brew install sqlmap"],
+        "apt": ["sudo apt-get update", "sudo apt-get install -y sqlmap"],
+        "pacman": ["sudo pacman -Sy --noconfirm sqlmap"],
+        "dnf": ["sudo dnf install -y sqlmap"],
+    },
+    "gobuster": {
+        "brew": ["brew install gobuster"],
+        "apt": ["sudo apt-get update", "sudo apt-get install -y gobuster"],
+        "pacman": ["sudo pacman -Sy --noconfirm gobuster"],
+        "dnf": ["sudo dnf install -y gobuster"],
+    },
+    "nmap": {
+        "brew": ["brew install nmap"],
+        "apt": ["sudo apt-get update", "sudo apt-get install -y nmap"],
+        "pacman": ["sudo pacman -Sy --noconfirm nmap"],
+        "dnf": ["sudo dnf install -y nmap"],
+    },
+    "nikto": {
+        "brew": ["brew install nikto"],
+        "apt": ["sudo apt-get update", "sudo apt-get install -y nikto"],
+        "pacman": ["sudo pacman -Sy --noconfirm nikto"],
+        "dnf": ["sudo dnf install -y nikto"],
+    },
+    "whatweb": {
+        "brew": ["brew install whatweb"],
+        "apt": ["sudo apt-get update", "sudo apt-get install -y whatweb"],
+        "pacman": ["sudo pacman -Sy --noconfirm whatweb"],
+        "dnf": ["sudo dnf install -y whatweb"],
+    },
+    "ffuf": {
+        "brew": ["brew install ffuf"],
+        "apt": ["sudo apt-get update", "sudo apt-get install -y ffuf"],
+        "pacman": ["sudo pacman -Sy --noconfirm ffuf"],
+        "dnf": ["sudo dnf install -y ffuf"],
+        "go": ["go install github.com/ffuf/ffuf/v2@latest"],
+    },
+    "binwalk": {
+        "brew": ["brew install binwalk"],
+        "apt": ["sudo apt-get update", "sudo apt-get install -y binwalk"],
+        "pacman": ["sudo pacman -Sy --noconfirm binwalk"],
+        "dnf": ["sudo dnf install -y binwalk"],
+        "pip": ["pip3 install --user binwalk"],
+    },
+    "hydra": {
+        "brew": ["brew install hydra"],
+        "apt": ["sudo apt-get update", "sudo apt-get install -y hydra"],
+        "pacman": ["sudo pacman -Sy --noconfirm hydra"],
+        "dnf": ["sudo dnf install -y hydra"],
+    },
+    # Complementarias
+    "exiftool": {
+        "brew": ["brew install exiftool"],
+        "apt": ["sudo apt-get update", "sudo apt-get install -y libimage-exiftool-perl"],
+        "pacman": ["sudo pacman -Sy --noconfirm exiftool"],
+        "dnf": ["sudo dnf install -y perl-Image-ExifTool"],
+    },
+    "rabin2": {  # via radare2
+        "brew": ["brew install radare2"],
+        "apt": ["sudo apt-get update", "sudo apt-get install -y radare2"],
+        "pacman": ["sudo pacman -Sy --noconfirm radare2"],
+        "dnf": ["sudo dnf install -y radare2"],
+    },
+    "ciphey": {
+        "brew": ["brew install ciphey"],
+        "pip": ["pip3 install --user ciphey"],
+    },
+    "httpx": {
+        "brew": ["brew install httpx"],
+        "apt": ["sudo apt-get update", "sudo apt-get install -y httpx"],
+        "go": ["go install github.com/projectdiscovery/httpx/cmd/httpx@latest"],
+    },
+    "amass": {
+        "brew": ["brew install amass"],
+        "apt": ["sudo apt-get update", "sudo apt-get install -y amass"],
+        "dnf": ["sudo dnf install -y amass"],
+    },
+    "assetfinder": {
+        "brew": ["brew install assetfinder"],
+        "go": ["go install github.com/tomnomnom/assetfinder@latest"],
+    },
+    "subfinder": {
+        "brew": ["brew install subfinder"],
+        "apt": ["sudo apt-get update", "sudo apt-get install -y subfinder"],
+        "go": ["go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"],
+    },
+    "strings": {
+        "apt": ["sudo apt-get update", "sudo apt-get install -y binutils"],
+        "pacman": ["sudo pacman -Sy --noconfirm binutils"],
+        "dnf": ["sudo dnf install -y binutils"],
+        # macOS suele tener /usr/bin/strings; en caso extremo, brew binutils ofrece gstrings
+        "brew": ["brew install binutils"],
+    },
+}
+
+
+def _detect_pkg_manager() -> str | None:
+    if _is_macos() and _exists("brew"):
+        return "brew"
+    # Linux
+    for mgr in ("apt", "pacman", "dnf"):
+        if mgr == "apt" and (_exists("apt") or _exists("apt-get")):
+            return "apt"
+        if mgr == "pacman" and _exists("pacman"):
+            return "pacman"
+        if mgr == "dnf" and _exists("dnf"):
+            return "dnf"
+    return None
+
+
+def _try_install(tool: str, *, manager: str | None = None, dry_run: bool = False) -> bool:
+    recipes = _CTF_INSTALL_RECIPES.get(tool) or {}
+    order: list[str] = []
+    if manager:
+        order = [manager]
+    else:
+        pm = _detect_pkg_manager()
+        if pm:
+            order.append(pm)
+        # Fallbacks según naturaleza de la herramienta
+        for alt in ("pip", "go"):
+            if alt not in order and alt in recipes:
+                order.append(alt)
+    cwd = Path.cwd()
+    for m in order:
+        cmds = recipes.get(m) or []
+        if not cmds:
+            continue
+        print(f"[INFO] Intentando instalar {tool} con {m}...")
+        all_ok = True
+        for c in cmds:
+            if dry_run:
+                print("  $", c)
+                continue
+            code, out = _run_shell(c, cwd, background=False, stream=False)
+            if code != 0:
+                all_ok = False
+                print(_limit_lines(out, 60))
+                break
+        if dry_run:
+            # En dry-run asumimos que este método sería el usado
+            return True
+        if all_ok:
+            # Verificar presencia
+            if _ensure_tool(tool):
+                return True
+    return False
+
+
+def cmd_ctf_install(args: argparse.Namespace) -> int:
+    if not _ctf_require_secret(getattr(args, "key", None)):
+        return 1
+    only: list[str] = getattr(args, "tool", []) or []
+    install_all = bool(getattr(args, "all", False))
+    dry_run = bool(getattr(args, "dry_run", False))
+    manager = getattr(args, "manager", None)
+    # Lista objetivo
+    all_tools = sorted(set(list(_CTF_INSTALL_RECIPES.keys())))
+    if only and install_all:
+        print("[ERROR] Usa --all o --tool repetido, no ambos")
+        return 2
+    targets = all_tools if install_all or not only else only
+    # Filtrar ya presentes
+    missing = [t for t in targets if not _ensure_tool(t)]
+    if not missing and not dry_run:
+        print("[OK] No hay herramientas faltantes de la lista objetivo.")
+        return 0
+    print("[PLAN] Instalar herramientas:", ", ".join(missing if missing else targets))
+    ok_all = True
+    for t in (missing if missing else targets):
+        ok = _try_install(t, manager=manager, dry_run=dry_run)
+        if not dry_run:
+            # comprobar nuevamente
+            ok = ok and _ensure_tool(t)
+        print(f"[{'OK' if ok else 'FAIL'}] {t}")
+        if not ok:
+            ok_all = False
+            # sugerencias web conocidas
+            hints = {
+                "sqlmap": ["https://sqlmap.org/", "https://formulae.brew.sh/formula/sqlmap"],
+                "gobuster": ["https://github.com/OJ/gobuster", "https://formulae.brew.sh/formula/gobuster"],
+                "nmap": ["https://nmap.org/download", "https://formulae.brew.sh/formula/nmap"],
+                "nikto": ["https://github.com/sullo/nikto", "https://formulae.brew.sh/formula/nikto"],
+                "whatweb": ["https://github.com/urbanadventurer/WhatWeb", "https://formulae.brew.sh/formula/whatweb"],
+                "ffuf": ["https://github.com/ffuf/ffuf", "https://formulae.brew.sh/formula/ffuf"],
+                "binwalk": ["https://github.com/ReFirmLabs/binwalk", "https://formulae.brew.sh/formula/binwalk"],
+                "hydra": ["https://github.com/vanhauser-thc/thc-hydra", "https://formulae.brew.sh/formula/hydra"],
+                "exiftool": ["https://exiftool.org/", "https://formulae.brew.sh/formula/exiftool"],
+                "rabin2": ["https://rada.re/n/", "https://formulae.brew.sh/formula/radare2"],
+                "ciphey": ["https://github.com/ciphey/ciphey", "https://pypi.org/project/ciphey/"],
+                "httpx": ["https://github.com/projectdiscovery/httpx", "https://formulae.brew.sh/formula/httpx"],
+                "amass": ["https://github.com/owasp-amass/amass", "https://formulae.brew.sh/formula/amass"],
+                "assetfinder": ["https://github.com/tomnomnom/assetfinder", "https://formulae.brew.sh/formula/assetfinder"],
+                "subfinder": ["https://github.com/projectdiscovery/subfinder", "https://formulae.brew.sh/formula/subfinder"],
+                "strings": ["https://www.gnu.org/software/binutils/"],
+            }
+            urls = hints.get(t, [])
+            if urls:
+                print("[HINT] Consulta documentación de instalación:")
+                for u in urls:
+                    print("  -", u)
+    if dry_run:
+        print("[DRY-RUN] No se ejecutó ninguna instalación.")
+        return 0
+    return 0 if ok_all else 1
+
+
+def cmd_ctf_set_key(_args: argparse.Namespace) -> int:
+    try:
+        _spinner_pause()
+        s1 = getpass.getpass("Nueva clave CTF: ")
+        s2 = getpass.getpass("Repite clave CTF: ")
+    finally:
+        _spinner_resume()
+    if not s1:
+        print("[ERROR] Clave vacía")
+        return 2
+    if s1 != s2:
+        print("[ERROR] Las claves no coinciden")
+        return 2
+    _ctf_set_secret(s1)
+    print("[OK] Clave CTF establecida")
+    return 0
+
+
+def cmd_ctf_status(_args: argparse.Namespace) -> int:
+    st = _ctf_tools_status()
+    enabled = bool(_ctf_secret_record())
+    print("[CTF] estado: enabled=" + str(enabled))
+    for k, v in sorted(st.items()):
+        print(f" - {k}: {'OK' if v else 'no'}")
+    return 0
+
+
+def cmd_ctf_unset_key(_args: argparse.Namespace) -> int:
+    sec = _security_section()
+    if "ctf_secret" in sec:
+        sec.pop("ctf_secret", None)
+        _security_save(sec)
+        print("[OK] Clave CTF eliminada. Debes definir una nueva con: piper ctf set-key")
+        return 0
+    print("[INFO] No había clave CTF definida")
+    return 0
+
+
+def _limit_lines(s: str, n: int = 200) -> str:
+    try:
+        lines = (s or "").splitlines()
+        if len(lines) <= n:
+            return (s or "").strip()
+        return "\n".join(lines[:n] + [f"... ({len(lines)-n} líneas más)"])
+    except Exception:
+        return (s or "")
+
+
+def _host_from_url(url: str) -> str | None:
+    try:
+        u = urlparse(url)
+        if u.hostname:
+            return u.hostname
+        # fallback: si no tiene esquema, tratar como hostname
+        if "://" not in url and "/" not in url:
+            return url
+    except Exception:
+        pass
+    return None
+
+
+def cmd_ctf_web(args: argparse.Namespace) -> int:
+    if not _ctf_require_secret(getattr(args, "key", None)):
+        return 1
+    target = getattr(args, "target", "")
+    if not target:
+        print("[ERROR] Debes pasar --target URL")
+        return 2
+    workdir = Path.cwd()
+    status = _ctf_tools_status()
+    print("[PLAN] Recon web rápido para:", target)
+    report: list[str] = []
+    ts = datetime.now().isoformat(timespec="seconds")
+    report.append(f"# Piper CTF — Recon web\n\n- Fecha: {ts}\n- Objetivo: {target}\n")
+    host = _host_from_url(target) or ""
+    # whatweb o headers
+    if status.get("whatweb"):
+        print("\n[RUN] whatweb")
+        code, out = _run_shell(f"whatweb --color=never -a 3 {json.dumps(target)}", workdir, background=False, stream=False)
+        if out:
+            print(out)
+            report.append("## whatweb\n\n" + "```\n" + _limit_lines(out, 200) + "\n```")
+    else:
+        print("\n[RUN] Encabezados HTTP (curl)")
+        code, out = _run_shell(f"curl -sSL -D - -o /dev/null {json.dumps(target)}", workdir, background=False, stream=False)
+        if out:
+            print(out)
+            report.append("## curl -I\n\n" + "```\n" + _limit_lines(out, 120) + "\n```")
+    # nmap si hay host
+    if host and status.get("nmap"):
+        print("\n[RUN] nmap top-100 puertos + versiones")
+        code, out = _run_shell(f"nmap -Pn -sV --top-ports 100 --open {json.dumps(host)}", workdir, background=False, stream=False)
+        if out:
+            print(out)
+            report.append("## nmap\n\n" + "```\n" + _limit_lines(out, 200) + "\n```")
+    # gobuster dir (si URL http)
+    if status.get("gobuster") and target.startswith(("http://", "https://")):
+        wl = getattr(args, "wordlist", None) or "/usr/share/wordlists/dirb/common.txt"
+        print("\n[RUN] gobuster dir (rápido)")
+        code, out = _run_shell(f"gobuster dir -u {json.dumps(target)} -w {json.dumps(wl)} -q -t 30 -k", workdir, background=False, stream=False)
+        if out:
+            print(out)
+            report.append("## gobuster dir\n\n" + "```\n" + _limit_lines(out, 200) + "\n```")
+    # nikto (si disponible)
+    if status.get("nikto") and target.startswith(("http://", "https://")):
+        print("\n[RUN] nikto (chequeos básicos)")
+        code, out = _run_shell(f"nikto -host {json.dumps(target)} -nolookup -Tuning x 2>/dev/null", workdir, background=False, stream=False)
+        if out:
+            print(out)
+            report.append("## nikto\n\n" + "```\n" + _limit_lines(out, 200) + "\n```")
+    # sqlmap (mínimo invasivo)
+    if status.get("sqlmap"):
+        print("\n[RUN] sqlmap (ligero)")
+        code, out = _run_shell(f"sqlmap -u {json.dumps(target)} --batch --random-agent --level=1 --risk=1 --crawl=1 --smart --timeout=10 --technique=BEUSTQ 2>/dev/null", workdir, background=False, stream=False)
+        if out:
+            print(out)
+            report.append("## sqlmap\n\n" + "```\n" + _limit_lines(out, 200) + "\n```")
+    print("\n[OK] Recon web básico completado.")
+    rpt = getattr(args, "report", None)
+    if rpt:
+        md = "\n\n".join(report) + "\n"
+        _maybe_save_output(Path.cwd(), str(rpt), md)
+    return 0
+
+
+def _read_small(file: Path, max_bytes: int = 1024 * 1024) -> bytes:
+    try:
+        with file.open("rb") as fh:
+            return fh.read(max_bytes)
+    except Exception:
+        return b""
+
+
+def _try_b64(s: str) -> str | None:
+    t = s.strip()
+    if not t or len(t) < 16:
+        return None
+    try:
+        b = base64.b64decode(t + ("=" * ((4 - len(t) % 4) % 4)), validate=True)
+        decoded = b.decode("utf-8", errors="ignore")
+        if decoded and any(ch.isprintable() for ch in decoded):
+            return decoded
+    except Exception:
+        return None
+    return None
+
+
+def cmd_ctf_code(args: argparse.Namespace) -> int:
+    if not _ctf_require_secret(getattr(args, "key", None)):
+        return 1
+    root = Path(getattr(args, "path", ".")).expanduser().resolve()
+    if not root.exists() or not root.is_dir():
+        print(f"[ERROR] Carpeta no válida: {root}")
+        return 2
+    status = _ctf_tools_status()
+    report: list[str] = []
+    ts = datetime.now().isoformat(timespec="seconds")
+    report.append(f"# Piper CTF — Análisis de carpeta\n\n- Fecha: {ts}\n- Carpeta: {root}\n")
+    print(f"[PLAN] Escaneo estático de {root}")
+    total_exam = 0
+    flags_found: list[str] = []
+    for p in root.rglob("*"):
+        if total_exam > 2000:
+            break
+        if p.is_dir():
+            continue
+        total_exam += 1
+        try:
+            sz = p.stat().st_size
+        except Exception:
+            sz = 0
+        # Buscar flag{...}
+        content_preview = b""
+        if sz <= 5 * 1024 * 1024:  # 5MB
+            content_preview = _read_small(p, max_bytes=256 * 1024)
+            txt = content_preview.decode("utf-8", errors="ignore")
+            for m in re.findall(r"flag\{[^}]{3,100}\}", txt, flags=re.IGNORECASE):
+                flags_found.append(f"{p}: {m}")
+            # base64 líneas
+            for line in txt.splitlines():
+                dec = _try_b64(line.strip())
+                if dec and re.search(r"flag\{[^}]+\}", dec, flags=re.IGNORECASE):
+                    flags_found.append(f"{p}: {dec.strip()[:200]}")
+        # Ejecutables/bins: strings y binwalk
+        if status.get("strings") and sz and sz <= 50 * 1024 * 1024:
+            code, out = _run_shell(f"strings {json.dumps(str(p))}", root, background=False, stream=False)
+            if code == 0 and out:
+                sample = "\n".join(out.splitlines()[:200])
+                print(sample)
+                report.append(f"## strings {p.name}\n\n" + "```\n" + _limit_lines(sample, 200) + "\n```")
+                for m in re.findall(r"flag\{[^}]{3,100}\}", sample, flags=re.IGNORECASE):
+                    flags_found.append(f"{p}: {m}")
+        if status.get("binwalk") and sz and sz <= 100 * 1024 * 1024:
+            # análisis superficial sin extraer
+            code, out = _run_shell(f"binwalk {json.dumps(str(p))}", root, background=False, stream=False)
+            if out:
+                sample = "\n".join(out.splitlines()[:20])
+                print(sample)
+                report.append(f"## binwalk {p.name}\n\n" + "```\n" + _limit_lines(sample, 40) + "\n```")
+    if flags_found:
+        print("\n[HALLAZGOS] Posibles flags detectadas:")
+        for h in flags_found[:20]:
+            print(" - ", h)
+        if len(flags_found) > 20:
+            print(f" ... y {len(flags_found) - 20} más")
+    else:
+        print("\n[HALLAZGOS] No se detectaron patrones de flag obvios.")
+        report.append("## Hallazgos (flags)\n\nNo se detectaron patrones obvios.")
+    print("\n[OK] Escaneo estático finalizado.")
+    rpt = getattr(args, "report", None)
+    if rpt:
+        md = "\n\n".join(report) + "\n"
+        _maybe_save_output(Path.cwd(), str(rpt), md)
+    return 0
+
+
+def cmd_ctf_osint(args: argparse.Namespace) -> int:
+    if not _ctf_require_secret(getattr(args, "key", None)):
+        return 1
+    domain = getattr(args, "domain", "").strip()
+    if not domain:
+        print("[ERROR] Debes indicar --domain")
+        return 2
+    max_lines = int(getattr(args, "max", 200) or 200)
+    workdir = Path.cwd()
+    status = _ctf_tools_status()
+    print(f"[PLAN] OSINT para {domain}")
+    report: list[str] = []
+    ts = datetime.now().isoformat(timespec="seconds")
+    report.append(f"# Piper CTF — OSINT\n\n- Fecha: {ts}\n- Dominio: {domain}\n")
+    # subfinder
+    if status.get("subfinder"):
+        print("\n[RUN] subfinder (pasivo)")
+        code, out = _run_shell(f"subfinder -silent -d {json.dumps(domain)}", workdir, background=False, stream=False)
+        out = "\n".join(out.splitlines()[:max_lines]) if out else ""
+        if out:
+            print(out)
+            report.append("## subfinder\n\n" + "```\n" + _limit_lines(out, 200) + "\n```")
+    # amass
+    if status.get("amass"):
+        print("\n[RUN] amass enum (pasivo)")
+        code, out = _run_shell(f"amass enum -passive -d {json.dumps(domain)}", workdir, background=False, stream=False)
+        out = "\n".join(out.splitlines()[:max_lines]) if out else ""
+        if out:
+            print(out)
+            report.append("## amass\n\n" + "```\n" + _limit_lines(out, 200) + "\n```")
+    # assetfinder
+    if status.get("assetfinder"):
+        print("\n[RUN] assetfinder")
+        code, out = _run_shell(f"assetfinder --subs-only {json.dumps(domain)}", workdir, background=False, stream=False)
+        out = "\n".join(out.splitlines()[:max_lines]) if out else ""
+        if out:
+            print(out)
+            report.append("## assetfinder\n\n" + "```\n" + _limit_lines(out, 200) + "\n```")
+    # httpx probing
+    if status.get("httpx"):
+        print("\n[RUN] httpx (probar HTTP vivo)")
+        cmd = f"(echo {json.dumps(domain)}; echo www.{domain}) | httpx -silent -timeout 5 -status-code -title -tech-detect"
+        code, out = _run_shell(cmd, workdir, background=False, stream=False)
+        out = "\n".join(out.splitlines()[:max_lines]) if out else ""
+        if out:
+            print(out)
+            report.append("## httpx\n\n" + "```\n" + _limit_lines(out, 200) + "\n```")
+    print("\n[OK] OSINT básico completado.")
+    rpt = getattr(args, "report", None)
+    if rpt:
+        md = "\n\n".join(report) + "\n"
+        _maybe_save_output(Path.cwd(), str(rpt), md)
+    return 0
+
+
+def _decode_attempts(data: bytes) -> list[tuple[str,str]]:
+    outs: list[tuple[str,str]] = []
+    txt = data.decode("utf-8", errors="ignore")
+    # hex
+    try:
+        if re.fullmatch(r"[0-9a-fA-F\s]+", txt.strip()) and len(txt.strip()) % 2 == 0:
+            raw = bytes.fromhex(re.sub(r"\s+", "", txt))
+            outs.append(("hex->utf8", raw.decode("utf-8", errors="ignore")))
+    except Exception:
+        pass
+    # base64
+    for name, enc in [("base64", base64.b64decode), ("base32", base64.b32decode), ("base85", base64.b85decode), ("a85", base64.a85decode)]:
+        try:
+            s = txt.strip()
+            b = enc(s + ("=" * ((4 - len(s) % 4) % 4))) if name=="base64" else enc(s)
+            dec = b.decode("utf-8", errors="ignore")
+            if dec:
+                outs.append((name+"->utf8", dec))
+        except Exception:
+            pass
+    # rot13
+    try:
+        import codecs
+        outs.append(("rot13", codecs.decode(txt, "rot_13")))
+    except Exception:
+        pass
+    # caesar brute (A-Z)
+    def caesar(s: str, k: int) -> str:
+        out = []
+        for ch in s:
+            if "a" <= ch <= "z":
+                out.append(chr((ord(ch)-97+k)%26 + 97))
+            elif "A" <= ch <= "Z":
+                out.append(chr((ord(ch)-65+k)%26 + 65))
+            else:
+                out.append(ch)
+        return "".join(out)
+    sample = txt[:2000]
+    for k in range(1, 26):
+        c = caesar(sample, k)
+        if re.search(r"flag\{[^}]+\}", c, flags=re.IGNORECASE):
+            outs.append((f"caesar+{k}", caesar(txt, k)))
+            break
+    return outs
+
+
+def cmd_ctf_crypto(args: argparse.Namespace) -> int:
+    if not _ctf_require_secret(getattr(args, "key", None)):
+        return 1
+    data: bytes
+    if getattr(args, "text", None):
+        data = args.text.encode("utf-8")
+    else:
+        path = Path(getattr(args, "file", "")).expanduser().resolve()
+        if not path.exists():
+            print(f"[ERROR] No existe archivo: {path}")
+            return 2
+        data = _read_small(path, max_bytes=2*1024*1024)
+    outs = _decode_attempts(data)
+    if outs:
+        print("[OK] Decodificaciones potenciales:")
+        for name, val in outs[:5]:
+            preview = val.strip().splitlines()[:8]
+            print(f"- {name}:")
+            for ln in preview:
+                print("  ", ln)
+            if len(preview) == 8:
+                print("  ...")
+    else:
+        # ciphey si está
+        if _ensure_tool("ciphey"):
+            print("[RUN] ciphey (auto-decode)")
+            _run_shell("ciphey -q -t " + json.dumps(data.decode("utf-8", errors="ignore")), Path.cwd(), background=False, stream=True)
+        else:
+            print("[INFO] No se detectó decodificación obvia. Instala 'ciphey' para análisis más profundo.")
+    return 0
+
+
+def cmd_ctf_reverse(args: argparse.Namespace) -> int:
+    if not _ctf_require_secret(getattr(args, "key", None)):
+        return 1
+    f = Path(getattr(args, "file", "")).expanduser().resolve()
+    if not f.exists() or not f.is_file():
+        print(f"[ERROR] Archivo inválido: {f}")
+        return 2
+    st = _ctf_tools_status()
+    report: list[str] = []
+    ts = datetime.now().isoformat(timespec="seconds")
+    report.append(f"# Piper CTF — Reverse básico\n\n- Fecha: {ts}\n- Archivo: {f}\n")
+    print(f"[PLAN] Reverse básico de {f}")
+    if _ensure_tool("file"):
+        code, out = _run_shell("file " + json.dumps(str(f)), f.parent, background=False, stream=False)
+        if out:
+            print(out)
+            report.append("## file\n\n" + "```\n" + _limit_lines(out, 60) + "\n```")
+    if st.get("exiftool"):
+        code, out = _run_shell("exiftool " + json.dumps(str(f)), f.parent, background=False, stream=False)
+        if out:
+            sample = "\n".join(out.splitlines()[:40])
+            print(sample)
+            report.append("## exiftool\n\n" + "```\n" + _limit_lines(sample, 60) + "\n```")
+    if st.get("strings"):
+        code, out = _run_shell("strings " + json.dumps(str(f)), f.parent, background=False, stream=False)
+        if out:
+            sample = "\n".join(out.splitlines()[:200])
+            print(sample)
+            report.append("## strings\n\n" + "```\n" + _limit_lines(sample, 220) + "\n```")
+    if st.get("binwalk"):
+        code, out = _run_shell("binwalk " + json.dumps(str(f)), f.parent, background=False, stream=False)
+        if out:
+            sample = "\n".join(out.splitlines()[:20])
+            print(sample)
+            report.append("## binwalk\n\n" + "```\n" + _limit_lines(sample, 40) + "\n```")
+    if st.get("rabin2"):
+        code, out = _run_shell("rabin2 -I " + json.dumps(str(f)), f.parent, background=False, stream=False)
+        if out:
+            print(out)
+            report.append("## rabin2 -I\n\n" + "```\n" + _limit_lines(out, 120) + "\n```")
+    print("\n[OK] Reverse básico completado.")
+    rpt = getattr(args, "report", None)
+    if rpt:
+        md = "\n\n".join(report) + "\n"
+        _maybe_save_output(Path.cwd(), str(rpt), md)
+    return 0
+
+
+def _http_get(url: str, headers: dict[str,str] | None = None, timeout: float = 8.0) -> tuple[int, str]:
+    try:
+        req = urllib.request.Request(url, headers=headers or {"User-Agent":"PiperCTF/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+            return resp.getcode() or 0, body
+    except Exception as e:
+        return 0, str(e)
+
+
+def _inject_param(url: str, param: str, payload: str) -> str:
+    try:
+        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+        u = urlparse(url)
+        q = parse_qs(u.query)
+        q[param] = [payload]
+        new_q = urlencode(q, doseq=True)
+        return urlunparse((u.scheme, u.netloc, u.path, u.params, new_q, u.fragment))
+    except Exception:
+        return url
+
+
+def cmd_ctf_probe(args: argparse.Namespace) -> int:
+    if not _ctf_require_secret(getattr(args, "key", None)):
+        return 1
+    base = getattr(args, "url", "").strip()
+    param = getattr(args, "param", "").strip()
+    if not base or not param:
+        print("[ERROR] Debes pasar --url y --param")
+        return 2
+    print(f"[PLAN] Probe SSTI en {base} param={param}")
+    payloads = [
+        ("jinja2", "{{7*7}}", "49"),
+        ("django", "{{7*7}}", "49"),
+        ("twig", "{{7*7}}", "49"),
+        ("erb", "<%= 7*7 %>", "49"),
+    ]
+    for name, pl, expect in payloads:
+        url = _inject_param(base, param, pl)
+        code, body = _http_get(url)
+        if code and expect in body:
+            print(f"[VULN] Posible SSTI ({name}): payload {pl!r} produjo {expect}")
+    print("[OK] Probe SSTI finalizado.")
+    return 0
+
+
+def cmd_ctf_creds(args: argparse.Namespace) -> int:
+    if not _ctf_require_secret(getattr(args, "key", None)):
+        return 1
+    if not getattr(args, "legal", False):
+        print("[ERROR] Debes confirmar --legal para ejecutar hydra en un entorno autorizado.")
+        return 2
+    if not _ensure_tool("hydra"):
+        print("[ERROR] 'hydra' no está instalado en PATH")
+        return 1
+    host = getattr(args, "host", "").strip()
+    service = getattr(args, "service", "").strip()
+    users = Path(getattr(args, "users", "")).expanduser().resolve()
+    passes = Path(getattr(args, "passwords", "")).expanduser().resolve()
+    if not host or not service or not users.exists() or not passes.exists():
+        print("[ERROR] Parámetros inválidos (host/service/users/passwords)")
+        return 2
+    threads = int(getattr(args, "threads", 4) or 4)
+    print(f"[RUN] hydra contra {host} servicio {service} (threads={threads})")
+    cmd = f"hydra -L {json.dumps(str(users))} -P {json.dumps(str(passes))} {json.dumps(host)} {json.dumps(service)} -t {threads} -f -I -W 3 -vV"
+    _run_shell(cmd, Path.cwd(), background=False, stream=True)
+    return 0
+
+
 def cmd_apply_notes(args: argparse.Namespace) -> int:
     proj_dir = Path(args.dir).expanduser().resolve()
     notes = proj_dir / "AI_NOTES.md"
@@ -2920,6 +3739,15 @@ def cmd_config(args: argparse.Namespace) -> int:
     mem = get_config() or {}
     defaults = mem.setdefault("defaults", {})
     changed = False
+    # Seguridad: server api key
+    if hasattr(args, "set_server_api_key") and args.set_server_api_key is not None:
+        _set_server_api_key(str(args.set_server_api_key))
+        changed = True
+        print("[OK] server_api_key establecido (requerido en /ask)")
+    if getattr(args, "unset_server_api_key", False):
+        _set_server_api_key(None)
+        changed = True
+        print("[OK] server_api_key eliminado (no se requerirá en /ask)")
     if args.set_max_ai_bytes is not None:
         try:
             val = int(args.set_max_ai_bytes)
@@ -2962,6 +3790,11 @@ def cmd_config(args: argparse.Namespace) -> int:
         print(f"max_ai_bytes: {d.get('max_ai_bytes', AI_TOTAL_BYTES_DEFAULT)}")
         print(f"max_ai_file_bytes: {d.get('max_ai_file_bytes', AI_FILE_BYTES_DEFAULT)}")
         print(f"smoke_python_default: {d.get('smoke_python_default', True)}")
+        sec = cur.get("security", {}) if isinstance(cur.get("security"), dict) else {}
+        srv = bool((sec.get("server_api_key") or ""))
+        ctf = bool(isinstance(sec.get("ctf_secret"), dict))
+        print(f"server_api_key_set: {srv}")
+        print(f"ctf_enabled: {ctf}")
     return 0
 
 
@@ -3341,7 +4174,87 @@ def build_parser() -> argparse.ArgumentParser:
     p_conf.add_argument("--set-max-ai-file-bytes", type=int, help="Fija máximo de bytes IA por archivo")
     p_conf.add_argument("--enable-smoke-python", action="store_true", help="Activa smoke run por defecto en stack 'python'")
     p_conf.add_argument("--disable-smoke-python", action="store_true", help="Desactiva smoke run por defecto en stack 'python'")
+    # Seguridad
+    p_conf.add_argument("--set-server-api-key", help="Establece API key para el servidor HTTP (X-API-Key)")
+    p_conf.add_argument("--unset-server-api-key", action="store_true", help="Elimina la API key del servidor HTTP")
     p_conf.set_defaults(func=cmd_config)
+
+    # CTF mode (protegido por clave)
+    p_ctf = sub.add_parser("ctf", help="Modo CTF profesional (requiere clave)")
+    ctf_sub = p_ctf.add_subparsers(dest="ctf_cmd")
+
+    p_ctf_key = ctf_sub.add_parser("set-key", help="Define/actualiza la clave del modo CTF")
+    p_ctf_key.set_defaults(func=cmd_ctf_set_key)
+
+    p_ctf_unkey = ctf_sub.add_parser("unset-key", help="Elimina la clave del modo CTF (revoca acceso)")
+    p_ctf_unkey.set_defaults(func=cmd_ctf_unset_key)
+
+    p_ctf_status = ctf_sub.add_parser("status", help="Muestra herramientas CTF detectadas")
+    p_ctf_status.set_defaults(func=cmd_ctf_status)
+
+    # Instalación de herramientas CTF
+    p_ctf_install = ctf_sub.add_parser("install", help="Instala herramientas CTF faltantes (brew/apt/pacman/dnf/pip/go)")
+    p_ctf_install.add_argument("--all", action="store_true", help="Instalar todas las herramientas recomendadas")
+    p_ctf_install.add_argument("--tool", action="append", help="Instalar sólo esta herramienta (repetible)")
+    p_ctf_install.add_argument("--manager", choices=["brew","apt","pacman","dnf","pip","go"], help="Forzar gestor de instalación")
+    p_ctf_install.add_argument("--dry-run", action="store_true", help="Mostrar comandos sin ejecutarlos")
+    p_ctf_install.add_argument("--key", help="Clave CTF")
+    p_ctf_install.set_defaults(func=cmd_ctf_install)
+
+    p_ctf_web = ctf_sub.add_parser("web", help="Recon web rápida contra un objetivo URL (sqlmap/gobuster/nikto si disponibles)")
+    p_ctf_web.add_argument("--target", required=True, help="URL objetivo (http/https)")
+    p_ctf_web.add_argument("--key", help="Clave CTF (si no se pasa, se solicitará o se usará $PIPER_CTF_KEY)")
+    p_ctf_web.add_argument("--wordlist", help="Wordlist para gobuster (opcional)")
+    p_ctf_web.add_argument("--limit", type=int, default=90, help="Límite de tiempo aprox por herramienta (s)")
+    p_ctf_web.add_argument("--report", help="Guardar reporte Markdown en ruta relativa (p. ej. 'recon_web.md')")
+    p_ctf_web.set_defaults(func=cmd_ctf_web)
+
+    p_ctf_code = ctf_sub.add_parser("code", help="Análisis estático de carpeta (strings/binwalk/patrones)")
+    p_ctf_code.add_argument("--path", required=True, help="Carpeta con material del reto")
+    p_ctf_code.add_argument("--key", help="Clave CTF (si no se pasa, se solicitará o se usará $PIPER_CTF_KEY)")
+    p_ctf_code.add_argument("--report", help="Guardar reporte Markdown en ruta relativa (p. ej. 'analisis_code.md')")
+    p_ctf_code.set_defaults(func=cmd_ctf_code)
+
+    # OSINT
+    p_ctf_osint = ctf_sub.add_parser("osint", help="OSINT para dominio: subdominios y probing HTTP")
+    p_ctf_osint.add_argument("--domain", required=True, help="Dominio base (ej. example.com)")
+    p_ctf_osint.add_argument("--key", help="Clave CTF")
+    p_ctf_osint.add_argument("--max", type=int, default=200, help="Límite de líneas por herramienta")
+    p_ctf_osint.add_argument("--report", help="Guardar reporte Markdown (p. ej. 'osint.md')")
+    p_ctf_osint.set_defaults(func=cmd_ctf_osint)
+
+    # Crypto/encodings
+    p_ctf_crypto = ctf_sub.add_parser("crypto", help="Decodifica/analiza textos (base64/hex/rot13/caesar)")
+    src = p_ctf_crypto.add_mutually_exclusive_group(required=True)
+    src.add_argument("--text", help="Texto a analizar")
+    src.add_argument("--file", help="Archivo a analizar")
+    p_ctf_crypto.add_argument("--key", help="Clave CTF")
+    p_ctf_crypto.set_defaults(func=cmd_ctf_crypto)
+
+    # Reverse básico
+    p_ctf_rev = ctf_sub.add_parser("reverse", help="Inspección binaria (file/strings/binwalk/exiftool)")
+    p_ctf_rev.add_argument("--file", required=True, help="Archivo binario a inspeccionar")
+    p_ctf_rev.add_argument("--key", help="Clave CTF")
+    p_ctf_rev.add_argument("--report", help="Guardar reporte Markdown (p. ej. 'reverse.md')")
+    p_ctf_rev.set_defaults(func=cmd_ctf_reverse)
+
+    # Probe (SSTI simples GET)
+    p_ctf_probe = ctf_sub.add_parser("probe", help="Pruebas sencillas de SSTI (no destructivas)")
+    p_ctf_probe.add_argument("--url", required=True, help="URL base (ej. https://host/path?param=VAL)")
+    p_ctf_probe.add_argument("--param", required=True, help="Nombre del parámetro donde inyectar payloads")
+    p_ctf_probe.add_argument("--key", help="Clave CTF")
+    p_ctf_probe.set_defaults(func=cmd_ctf_probe)
+
+    # Credenciales controladas (hydra)
+    p_ctf_creds = ctf_sub.add_parser("creds", help="Ataques de credenciales controlados con hydra (autorizado)")
+    p_ctf_creds.add_argument("--host", required=True, help="Host o IP")
+    p_ctf_creds.add_argument("--service", required=True, choices=["ssh","ftp"], help="Servicio objetivo")
+    p_ctf_creds.add_argument("--users", required=True, help="Ruta a lista de usuarios (-L)")
+    p_ctf_creds.add_argument("--passwords", required=True, help="Ruta a lista de contraseñas (-P)")
+    p_ctf_creds.add_argument("--threads", type=int, default=4, help="Hilos (hydra -t)")
+    p_ctf_creds.add_argument("--legal", action="store_true", help="Confirmo que es un entorno autorizado para pruebas")
+    p_ctf_creds.add_argument("--key", help="Clave CTF")
+    p_ctf_creds.set_defaults(func=cmd_ctf_creds)
 
     # Contexto inteligente: mostrar/limpiar/olvidar
     p_ctx = sub.add_parser("context", help="Gestiona el contexto inteligente (herramientas, decisiones, historial)")

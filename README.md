@@ -8,6 +8,7 @@ Asistente local de terminal que convierte prompts en proyectos y respuestas úti
    - Respuestas concisas tipo Copilot (sin bucles de preguntas).
    - Investigación web opcional (`--web`) o automática según el prompt (sin copiar código).
    - Intents locales: fecha/hora, IP (local/pública), OS info, búsqueda de archivos y clima.
+
 - Agente (`piper agent`): planifica y ejecuta comandos con streaming e inteligencia web ante fallos.
 - Investigación web independiente (`piper research --url ...`).
 - Control de servicio Ollama (`piper on` / `piper off`).
@@ -180,16 +181,19 @@ piper context --clear                # Limpia sólo el contexto (no la configura
 ```
 
 Integración:
+
 - `piper agent` consulta este contexto antes de preguntar por instalaciones; con `-y` instala sin preguntar.
 - `piper project` recuerda si aceptar o no aplicar `AI_NOTES.md` cuando no usas `--auto-apply-notes`.
 
 ### Asistencia automática ante fallos o comandos desconocidos (nuevo)
 
 `piper agent` ahora te ayuda por defecto cuando:
+
 - El paso incluye un comando que no está en tu PATH: busca rápidamente en la web cómo usarlo e intenta sugerir alternativas (con el modelo) antes de ejecutar.
 - Un comando falla: hace una búsqueda con el error, resume 2–3 páginas y pide al modelo alternativas concretas; puedes elegir una y reintentar al momento.
 
 Control:
+
 - Desactiva este comportamiento con `--no-auto-web-assist`.
 - Sigue disponible `--web` para añadir contexto web al plan inicial (además de la asistencia automática en fallos).
 
@@ -202,3 +206,14 @@ piper -h
 # o
 piper --help
 ```
+
+## Modo CTF (nuevo)
+
+Piper incluye un modo CTF protegido por clave con utilidades para recon, OSINT, cripto y reversing.
+
+- Guía completa: docs/CTF.txt
+- Ejemplos rápidos:
+  - `piper ctf set-key`
+  - `piper ctf install --all`
+  - `piper ctf web --target https://victima --report recon_web.md`
+  - `piper ctf osint --domain example.com --report osint.md`
