@@ -55,6 +55,12 @@ except Exception:
     def save_config(_cfg):  # type: ignore
         return None
 
+try:
+    from piper_codegen import generate_code as _generate_code
+except Exception:
+    def _generate_code(prompt_text, file_path, **kwargs):  # type: ignore
+        return False
+
 ROOT = Path(__file__).resolve().parent
 AI_TOTAL_BYTES_DEFAULT = int(os.environ.get("PIPER_AI_TOTAL_BYTES_DEFAULT", str(20 * 1024 * 1024)))  # 20MB
 AI_FILE_BYTES_DEFAULT = int(os.environ.get("PIPER_AI_FILE_BYTES_DEFAULT", str(2 * 1024 * 1024)))    # 2MB
@@ -2150,34 +2156,10 @@ def _validate_ai_relpath(base: Path, cand: str) -> tuple[bool, str, Path | None]
 
 # -------------------- Plantillas --------------------
 
-def scaffold_flask(dst: Path, prompt: str) -> None:
-    """[DEPRECATED] Esta función ya no se usa (se retiró 'piper project')."""
-    pass
-
-
-def scaffold_fastapi(dst: Path, prompt: str) -> None:
-    """[DEPRECATED] Esta función ya no se usa (se retiró 'piper project')."""
-    pass
-
-
-def scaffold_python(dst: Path, prompt: str) -> None:
-    """[DEPRECATED] Esta función ya no se usa (se retiró 'piper project')."""
-    pass
-
-
-def scaffold_node(dst: Path, prompt: str) -> None:
-    """[DEPRECATED] Esta función ya no se usa (se retiró 'piper project')."""
-    pass
-
-
-def scaffold_react(dst: Path, prompt: str) -> None:
-    """[DEPRECATED] Esta función ya no se usa (se retiró 'piper project')."""
-    pass
-
-
-def scaffold_go(dst: Path, prompt: str) -> None:
-    """[DEPRECATED] Esta función ya no se usa (se retiró 'piper project')."""
-    pass
+# Plantillas y scaffolds antiguos fueron removidos y ahora la generación
+# de archivos se delega en `src/piper_codegen.py`. Las funciones
+# específicas de scaffold quedaban marcadas como [DEPRECATED] y se
+# eliminaron para mantener este archivo más compacto.
 
 
 # -------------------- Comando principal --------------------
@@ -2754,6 +2736,62 @@ def cmd_agent(args: argparse.Namespace) -> int:
                 # Prefijar cd si no estamos ya dentro; se manejará luego
                 pass  # Lo gestionaremos al ejecutar
     steps = plan.get("steps", []) if isinstance(plan, dict) else []
+    # Heurística: mejorar planes para tareas Delaunay en español coloquial
+    normp_all = _normalize_text(args.prompt).lower()
+    if ("delaunay" in normp_all or "dalunay" in normp_all) and ("triangul" in normp_all or "triangulación" in normp_all):
+        # Determinar nombre de carpeta (buscar token después de 'carpeta')
+        m_name = re.search(r"carpeta\s+(?:en\s+downloads|descargas)?[,;]?\s*([\w._\-]{3,40})", normp_all)
+        folder_name = m_name.group(1) if m_name else "delaunay_triangulation"
+        downloads_dir = Path.home() / "Downloads" / folder_name
+        # Para generación automática, usamos una marca corta en el plan y delegamos
+        # la creación del código a _maybe_generate_code en tiempo de ejecución.
+        # Evitamos insertar bloques grandes de código dentro de este archivo.
+        delaunay_code = "__AUTO_GENERATE__ delaunay_example.py delaunay"
+        steps = [
+            {"desc": "Crear carpeta de trabajo Delaunay en Downloads", "cmd": f"mkdir -p {downloads_dir}"},
+            {"desc": "Entrar a la carpeta de trabajo", "cmd": f"cd {downloads_dir}"},
+            {"desc": "Crear entorno virtual aislado", "cmd": "python3 -m venv .venv"},
+            {"desc": "Instalar dependencias científicas", "cmd": "pip install scipy matplotlib numpy"},
+            {"desc": "Crear archivo fuente", "cmd": "touch delaunay_example.py"},
+            {"desc": "Escribir ejemplo completo Delaunay", "cmd": delaunay_code},
+            {"desc": "Ejecutar ejemplo para generar gráfica", "cmd": "python3 delaunay_example.py"},
+        ]
+        # Asegurar plan refleje override para etapas posteriores
+        if isinstance(plan, dict):
+            plan["steps"] = steps
+        # Preprocesar pasos: convertir invocaciones a editores en generación automática
+        if getattr(args, "auto_code", True) and steps:
+            new_steps: list[dict] = []
+            for st in steps:
+                cmd0 = (st.get("cmd") or "").strip()
+                m_ed = re.match(r"^(?:nano|vim|code)\s+([^\s]+\.py)\s*$", cmd0)
+                if m_ed:
+                    target = _resolve_under(workdir, m_ed.group(1))
+                    desc = f"Autogenerar {target.name} (editor omitido)"
+                    # En dry-run no escribir realmente, sólo sustituir por paso informativo
+                    if getattr(args, "dry_run", False):
+                        new_steps.append({"desc": desc, "cmd": f"echo 'AUTO: {target.name} (dry-run)'"})
+                        continue
+                    try:
+                        # Intentar generar código según prompt; _maybe_generate_code escribe el archivo si aplica
+                        ok = _maybe_generate_code(args.prompt, target)
+                        if ok:
+                            new_steps.append({"desc": desc, "cmd": f"echo 'Archivo {target.name} generado automáticamente'"})
+                            continue
+                        # Si no se generó, crear un stub mínimo
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        if not target.exists():
+                            target.write_text("#!/usr/bin/env python3\n# Archivo generado automáticamente por Piper CLI\n", encoding="utf-8")
+                        new_steps.append({"desc": f"Crear stub {target.name}", "cmd": f"echo 'Stub creado {target.name}'"})
+                        continue
+                    except Exception as e:
+                        # En caso de error, mantener el paso original para trazabilidad
+                        new_steps.append(st)
+                        continue
+                new_steps.append(st)
+            steps = new_steps
+            if isinstance(plan, dict):
+                plan["steps"] = steps
     if not steps:
         print("[ERROR] El modelo no devolvió un plan ejecutable.")
         return 1
@@ -3018,166 +3056,29 @@ def cmd_agent(args: argparse.Namespace) -> int:
             return m2.group(1).strip()
         return None
 
+    # Delegar generación de código al módulo piper_codegen (módulo externo)
     def _maybe_generate_code(prompt_text: str, file_path: Path) -> bool:
-        """Genera código automáticamente según el prompt si detectamos un patrón conocido.
-        Devuelve True si se escribió el archivo.
-        """
-        pt = _normalize_text(prompt_text)
-        out = None
-        # Inspiración web breve (no copiar código): buscar si hay término algoritmo
-        algo_term = None
-        for key in ["delaunay","bfs","dfs","a*","a star","dijkstra","quicksort","merge sort","mergesort","astar","k-means","kmeans"]:
-            if key.replace(" ", "") in pt.replace(" ", ""):
-                algo_term = key
-                break
-        web_inspo = ""
-        if algo_term and getattr(args, "auto_code", True):
-            try:
-                q = f"python {algo_term} algorithm explanation"
-                urls = search_web(q, max_results=3, timeout=10)
-                if urls:
-                    web_inspo = research_urls(urls[:2])[:1000]
-            except Exception:
-                web_inspo = ""
-        def _header(doc: str) -> str:
-            if not web_inspo:
-                return doc
-            lines = ["# " + ln[:160] for ln in web_inspo.splitlines() if ln.strip()]
-            if len(lines) > 15:
-                lines = lines[:15]
-            return doc + "\n# Contexto (resumen web, sin código literal):\n" + "\n".join(lines) + "\n"
-        # Plantillas ampliadas
-        if algo_term and algo_term.startswith("delaunay"):
-            out = _header(
-                "#!/usr/bin/env python3\n"
-                "\"\"\"Triangulación de Delaunay - ejemplo autocontenido con matplotlib.\n\n"
-                "Requisitos: scipy, numpy, matplotlib (instálalos en tu venv).\n\"\"\"\n\n"
-                "import numpy as np\n"
-                "import matplotlib.pyplot as plt\n"
-                "from scipy.spatial import Delaunay\n\n"
-                "def demo_points():\n"
-                "    # Conjunto de puntos 2D (puedes ajustarlos)\n"
-                "    return np.array([\n"
-                "        [1.0, 1.0],\n"
-                "        [3.0, 0.5],\n"
-                "        [5.0, 4.0],\n"
-                "        [7.0, 6.0],\n"
-                "        [2.0, 4.0],\n"
-                "        [6.0, 2.0],\n"
-                "        [4.0, 3.0],\n"
-                "        [3.5, 5.5],\n"
-                "    ])\n\n"
-                "def plot_delaunay(points: np.ndarray) -> None:\n"
-                "    \"\"\"Calcula la triangulación de Delaunay y grafica puntos y aristas.\"\"\"\n"
-                "    tri = Delaunay(points)\n"
-                "    fig, ax = plt.subplots(figsize=(6, 5))\n"
-                "    ax.plot(points[:, 0], points[:, 1], 'ko', label='Puntos')\n"
-                "    for simplex in tri.simplices:\n"
-                "        triangle = np.vstack([points[simplex], points[simplex[0]]])\n"
-                "        ax.plot(triangle[:, 0], triangle[:, 1], '-', color='#1f77b4', linewidth=1.8)\n"
-                "    ax.set_title('Triangulación de Delaunay')\n"
-                "    ax.set_xlabel('x')\n"
-                "    ax.set_ylabel('y')\n"
-                "    ax.set_aspect('equal', adjustable='box')\n"
-                "    ax.grid(True, alpha=0.3)\n"
-                "    ax.legend(loc='best')\n"
-                "    plt.tight_layout()\n"
-                "    plt.show()\n\n"
-                "if __name__ == '__main__':\n"
-                "    pts = demo_points()\n"
-                "    plot_delaunay(pts)\n"
+        try:
+            return _generate_code(
+                prompt_text,
+                file_path,
+                search_web_func=search_web,
+                research_urls_func=research_urls,
+                normalize_func=_normalize_text,
+                write_file_func=write_file,
+                auto_code=getattr(args, "auto_code", True),
             )
-        elif algo_term in ("quicksort","mergesort","merge sort"):
-            out = _header(
-                "#!/usr/bin/env python3\n"
-                "\"\"\"Implementación educativa de QuickSort y MergeSort con pruebas simples.\n\n"
-                "Evitar peor caso usando pivote medio; MergeSort estable.\n\"\"\"\n\n"
-                "from __future__ import annotations\n"
-                "import random\n\n"
-                "def quicksort(arr):\n"
-                "    if len(arr) < 2: return arr[:]\n"
-                "    pivot = arr[len(arr)//2]\n"
-                "    left = [x for x in arr if x < pivot]\n"
-                "    mid  = [x for x in arr if x == pivot]\n"
-                "    right= [x for x in arr if x > pivot]\n"
-                "    return quicksort(left) + mid + quicksort(right)\n\n"
-                "def mergesort(arr):\n"
-                "    if len(arr) < 2: return arr[:]\n"
-                "    m = len(arr)//2\n"
-                "    return _merge(mergesort(arr[:m]), mergesort(arr[m:]))\n\n"
-                "def _merge(a,b):\n"
-                "    i=j=0; out=[]\n"
-                "    while i < len(a) and j < len(b):\n"
-                "        if a[i] <= b[j]: out.append(a[i]); i+=1\n"
-                "        else: out.append(b[j]); j+=1\n"
-                "    out.extend(a[i:]); out.extend(b[j:]); return out\n\n"
-                "if __name__=='__main__':\n"
-                "    data = [random.randint(0,50) for _ in range(15)]\n"
-                "    print('Original', data)\n"
-                "    print('QuickSort', quicksort(data))\n"
-                "    print('MergeSort', mergesort(data))\n"
-            )
-        elif algo_term in ("bfs","dfs"):
-            out = _header(
-                "#!/usr/bin/env python3\n"
-                "\"\"\"BFS y DFS sobre grafo no dirigido representado con listas de adyacencia.\n\"\"\"\n\n"
-                "from collections import deque\n\n"
-                "def bfs(graph, start):\n"
-                "    visited=set([start]); order=[]; q=deque([start])\n"
-                "    while q:\n"
-                "        v=q.popleft(); order.append(v)\n"
-                "        for w in graph.get(v,[]):\n"
-                "            if w not in visited:\n"
-                "                visited.add(w); q.append(w)\n"
-                "    return order\n\n"
-                "def dfs(graph, start):\n"
-                "    visited=set(); order=[]\n"
-                "    def _rec(v):\n"
-                "        visited.add(v); order.append(v)\n"
-                "        for w in graph.get(v,[]):\n"
-                "            if w not in visited: _rec(w)\n"
-                "    _rec(start); return order\n\n"
-                "if __name__=='__main__':\n"
-                "    g={'A':['B','C'],'B':['D'],'C':['E'],'D':[],'E':[]}\n"
-                "    print('BFS', bfs(g,'A'))\n"
-                "    print('DFS', dfs(g,'A'))\n"
-            )
-        elif algo_term in ("dijkstra","a*","astar","a star"):
-            out = _header(
-                "#!/usr/bin/env python3\n"
-                "\"\"\"Dijkstra y A* (heurística Manhattan) sobre grafo ponderado.\n\"\"\"\n\n"
-                "import heapq\n\n"
-                "def dijkstra(graph, start):\n"
-                "    dist={start:0}; pq=[(0,start)]; prev={}\n"
-                "    while pq:\n"
-                "        d,v=heapq.heappop(pq)\n"
-                "        if d>dist.get(v,1e18): continue\n"
-                "        for w,c in graph.get(v,[]):\n"
-                "            nd=d+c\n"
-                "            if nd<dist.get(w,1e18):\n"
-                "                dist[w]=nd; prev[w]=v; heapq.heappush(pq,(nd,w))\n"
-                "    return dist, prev\n\n"
-                "def heuristic(a,b): x1,y1=a; x2,y2=b; return abs(x1-x2)+abs(y1-y2)\n\n"
-                "def astar(graph, start, goal):\n"
-                "    open=[(0,start)]; g={start:0}; came={}\n"
-                "    while open:\n"
-                "        _,current=heapq.heappop(open)\n"
-                "        if current==goal: break\n"
-                "        for neigh,cost in graph.get(current,[]):\n"
-                "            tentative=g[current]+cost\n"
-                "            if tentative < g.get(neigh,1e18):\n"
-                "                g[neigh]=tentative; f=tentative+heuristic(neigh,goal); heapq.heappush(open,(f,neigh)); came[neigh]=current\n"
-                "    return g, came\n\n"
-                "if __name__=='__main__':\n"
-                "    G={(0,0):[((1,0),1),((0,1),1)],(1,0):[((1,1),1)],(0,1):[((1,1),1)],(1,1):[]}\n"
-                "    print('Dijkstra', dijkstra(G,(0,0))[0])\n"
-                "    print('A*', astar(G,(0,0),(1,1))[0])\n"
-            )
-        if out:
-            write_file(file_path, out + "\n")
-            print(f"[OK] Código generado automáticamente en {file_path.name}")
-            return True
-        return False
+        except Exception:
+            return False
+    def _resolve_under(base: Path, s: str) -> Path:
+        s = (s or "").strip()
+        if not s:
+            return base
+        # Si es absoluta o inicia con ~, resolver directamente
+        if s.startswith("~") or os.path.isabs(s):
+            return Path(s).expanduser().resolve()
+        return (base / s).expanduser().resolve()
+
     for i, st in enumerate(steps, 1):
         desc = st.get("desc") or f"paso {i}"
         cmd = st.get("cmd") or ""
@@ -3198,7 +3099,7 @@ def cmd_agent(args: argparse.Namespace) -> int:
         # Detectar 'cd <path>' para cambiar directorio de trabajo
         m_cd = re.match(r"cd\s+(.+)$", cmd)
         if m_cd:
-            newdir = (workdir / m_cd.group(1)).expanduser().resolve()
+            newdir = _resolve_under(workdir, m_cd.group(1))
             if newdir.exists() and newdir.is_dir():
                 workdir = newdir
                 saw_cd = True
@@ -3207,12 +3108,12 @@ def cmd_agent(args: argparse.Namespace) -> int:
         # Detectar creación de venv para reescrituras siguientes
         m_venv = re.match(r"python3?\s+-m\s+venv\s+([\w./\-]+)", cmd)
         if m_venv:
-            vdir = (workdir / m_venv.group(1)).expanduser().resolve()
+            vdir = _resolve_under(workdir, m_venv.group(1))
             venv_dir = vdir
         # Recordar mkdir como preferencia de carpeta si no habrá 'cd'
         m_mkdir = re.match(r"mkdir\s+-p\s+(.+)$", cmd)
         if m_mkdir and not saw_cd:
-            preferred_dir = (workdir / m_mkdir.group(1)).expanduser().resolve()
+            preferred_dir = _resolve_under(workdir, m_mkdir.group(1))
         # Evitar 'source venv/bin/activate' (no persiste entre subprocess); usaremos binarios del venv directamente
         if " activate" in cmd and cmd.strip().startswith("source ") and \
            ("/bin/activate" in cmd or cmd.endswith("activate")):
@@ -3221,16 +3122,33 @@ def cmd_agent(args: argparse.Namespace) -> int:
         # Recordar último archivo .py si se toca/edita
         m_touch = re.match(r"touch\s+([^\s]+\.py)\s*$", cmd)
         if m_touch:
-            last_py_file = (workdir / m_touch.group(1)).expanduser().resolve()
-        m_nano = re.match(r"nano\s+([^\s]+\.py)\s*$", cmd)
-        if m_nano:
-            target = (workdir / m_nano.group(1)).expanduser().resolve()
+            last_py_file = _resolve_under(workdir, m_touch.group(1))
+        # Interceptar editores interactivos y reemplazar por generación automática
+        m_edit = re.match(r"(?:nano|vim|code)\s+([^\s]+\.py)\s*$", cmd)
+        if m_edit:
+            target = _resolve_under(workdir, m_edit.group(1))
             last_py_file = target
-            # Generar código automáticamente si es un patrón conocido y auto_code activo
-            if getattr(args, "auto_code", True) and _maybe_generate_code(args.prompt, target):
-                continue
+            if getattr(args, "auto_code", True):
+                if not target.exists():
+                    try:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.touch()
+                    except Exception:
+                        pass
+                if _maybe_generate_code(args.prompt, target):
+                    print(f"[OK] Código autogenerado en {target.name} (editor omitido)")
+                    continue
+                else:
+                    # Si no se pudo generar plantilla, insertar comentario base
+                    try:
+                        if not target.exists():
+                            target.write_text("#!/usr/bin/env python3\n# Archivo generado automáticamente por Piper CLI\n", encoding="utf-8")
+                        print(f"[OK] Archivo base creado en {target.name} (editor omitido)")
+                        continue
+                    except Exception as e:
+                        print(f"[WARN] No se pudo escribir archivo base {target}: {e}")
         # Si el "comando" es en realidad un bloque de código, extraer y escribir
-        if getattr(args, "auto_code", True) and ("```" in cmd or "import " in cmd):
+        if getattr(args, "auto_code", True) and ("```" in cmd or re.search(r"^(from\s+\S+\s+import|import\s+\S+)", cmd)):
             code_block = _extract_python_block(cmd)
             if code_block and last_py_file:
                 write_file(last_py_file, code_block + "\n")
@@ -3274,6 +3192,34 @@ def cmd_agent(args: argparse.Namespace) -> int:
                             print(f"[USE] Usando alternativa seleccionada: $ {cmd}")
                 else:
                     print("[INFO] No se encontraron alternativas relevantes o expiró el tiempo.")
+        # Interceptar marcadores de generación automática de código
+        if isinstance(cmd, str) and cmd.startswith("__AUTO_GENERATE__"):
+            parts = cmd.split()
+            # Formato esperado: __AUTO_GENERATE__ <target_file> [<keyword>]
+            target_rel = parts[1] if len(parts) > 1 else None
+            keyword = parts[2] if len(parts) > 2 else None
+            target = _resolve_under(workdir, target_rel) if target_rel else None
+            if getattr(args, "dry_run", False):
+                print(f"\n[RUN] {desc}\n$ echo 'AUTO-GENERATE {target_rel} (dry-run)'")
+                continue
+            try:
+                prompt_override = args.prompt + (f" {keyword}" if keyword else "")
+                ok = _maybe_generate_code(prompt_override, target)
+                if ok:
+                    print(f"[OK] Código autogenerado en {target}")
+                    last_py_file = target
+                    continue
+                else:
+                    print(f"[WARN] No se pudo autogenerar {target}; creando stub")
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if not target.exists():
+                        target.write_text("#!/usr/bin/env python3\n# Archivo generado automáticamente por Piper CLI\n", encoding="utf-8")
+                        last_py_file = target
+                        print(f"[OK] Stub creado en {target}")
+                        continue
+            except Exception as e:
+                print(f"[ERROR] Falló generación automática: {e}")
+                # caemos a ejecución normal si algo falla
         print(f"\n[RUN] {desc}\n$ {cmd}")
         code, out = _run_shell(
             cmd,
