@@ -2196,6 +2196,13 @@ def cmd_assist(args: argparse.Namespace) -> int:
     # --fast fuerza un modelo ligero por ejecución
     if getattr(args, "fast", False):
         args.model = "phi3:mini"
+    # Mostrar modelo efectivo si se solicita
+    if getattr(args, "show_model", False):
+        try:
+            resolved = _resolve_model(getattr(args, "model", None))
+            print(f"[MODEL] Usando modelo efectivo: {resolved}")
+        except Exception:
+            print("[MODEL] No se pudo resolver modelo (heurística falló)")
     # Intento local: si el prompt pide la fecha de hoy, responder sin IA
     prompt0 = getattr(args, "prompt", "")
     if _is_date_query(prompt0):
@@ -2702,7 +2709,10 @@ def cmd_agent(args: argparse.Namespace) -> int:
     # Modelo
     if getattr(args, "fast", False):
         args.model = "phi3:mini"
-    model = _ensure_model_available(_resolve_model(args.model))
+    model_resolved = _resolve_model(getattr(args, "model", None))
+    if getattr(args, "show_model", False):
+        print(f"[MODEL] Modelo planificador: {model_resolved}")
+    model = _ensure_model_available(model_resolved)
     # Contexto OS
     os_info = _os_info_text().replace("\n", "; ")
     # CWD para ejecución
@@ -4570,6 +4580,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_assist = sub.add_parser("assist", help="Asistente interactivo con aclaraciones")
     p_assist.add_argument("prompt", help="Petición inicial")
     p_assist.add_argument("--model", help="Modelo Ollama (por defecto PIPER_OLLAMA_MODEL o mistral:7b-instruct)")
+    p_assist.add_argument("--show-model", action="store_true", help="Muestra el modelo Ollama efectivo al inicio")
     p_assist.add_argument("--fast", action="store_true", help="Usar modelo rápido (phi3:mini) en esta ejecución")
     p_assist.add_argument("--no-tts", action="store_true", help="Desactiva TTS al responder (por defecto TTS está desactivado)")
     p_assist.add_argument("--freeform", action="store_true", help="Modo estilo chat: respuesta libre de texto (sin JSON)")
@@ -4596,6 +4607,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_agent = sub.add_parser("agent", help="Agente que infiere y ejecuta comandos a partir de una instrucción")
     p_agent.add_argument("prompt", help="Instrucción de alto nivel (qué hacer)")
     p_agent.add_argument("--model", help="Modelo Ollama a usar para planificar (por defecto heurístico)")
+    p_agent.add_argument("--show-model", action="store_true", help="Muestra el modelo Ollama efectivo al inicio")
     p_agent.add_argument("--fast", action="store_true", help="Usar modelo rápido (phi3:mini) en esta ejecución")
     p_agent.add_argument("--no-tts", action="store_true", help="Desactiva TTS al responder (por defecto desactivado)")
     p_agent.add_argument("--cwd", help="Directorio de trabajo para ejecutar los comandos (por defecto: cwd)")
