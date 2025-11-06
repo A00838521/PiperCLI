@@ -16,6 +16,8 @@ REPO_ROOT="$(cd "$HERE/.." && pwd)"
 DRY_RUN=0
 USE_SYSTEMD=1
 ENSURE_MODELS="${ENSURE_MODELS:-mistral:7b-instruct,phi3:mini}"
+MODEL_OVERRIDE=""
+DEFAULT_MODEL=""
 RESTORE_TAR=""
 WITH_CONFIG=""
 UBUNTU_DIAG=0      # Ejecutar diagnósticos/preparación con sudo (apt)
@@ -29,7 +31,8 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=1; shift ;;
     --no-systemd) USE_SYSTEMD=0; shift ;;
-    --ensure-models) ENSURE_MODELS="${2:-}"; shift 2 ;;
+  --ensure-models) ENSURE_MODELS="${2:-}"; shift 2 ;;
+  --model) MODEL_OVERRIDE="${2:-}"; shift 2 ;;
     --restore) RESTORE_TAR="${2:-}"; shift 2 ;;
     --with-config) WITH_CONFIG="${2:-}"; shift 2 ;;
     --ubuntu-diag) UBUNTU_DIAG=1; shift ;;
@@ -77,6 +80,12 @@ if [[ "$UBUNTU_DIAG" = 1 && "$IS_DEBIAN" = 1 ]]; then
   fi
 fi
 
+# Si se especifica --model, forzar sólo ese modelo y usarlo por defecto en Piper
+if [[ -n "$MODEL_OVERRIDE" ]]; then
+  ENSURE_MODELS="$MODEL_OVERRIDE"
+  DEFAULT_MODEL="$MODEL_OVERRIDE"
+fi
+
 # Crear carpetas destino
 run "mkdir -p '$PIPER_HOME/src' '$BIN_HOME' '$PIPER_HOME/logs' '$PIPER_STATE_DIR'"
 
@@ -90,16 +99,17 @@ else
   if [[ "$DRY_RUN" = 1 ]]; then
     say "+ Crear wrapper en $PIPER_WRAPPER"
   else
-    cat >"$PIPER_WRAPPER" <<'WRAP'
+  cat >"$PIPER_WRAPPER" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-PY=${PYTHON:-python3}
-PIPER_HOME="${PIPER_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/piper-cli}"
-APP_PATH="$PIPER_HOME/src/piper_cli.py"
-SRC_DIR="$PIPER_HOME/src"
-export PYTHONPATH="$SRC_DIR${PYTHONPATH:+:$PYTHONPATH}"
-exec "$PY" "$APP_PATH" "$@"
-WRAP
+PY=\${PYTHON:-python3}
+PIPER_HOME="\${PIPER_HOME:-\${XDG_DATA_HOME:-\$HOME/.local/share}/piper-cli}"
+APP_PATH="\$PIPER_HOME/src/piper_cli.py"
+SRC_DIR="\$PIPER_HOME/src"
+export PYTHONPATH="\$SRC_DIR\${PYTHONPATH:+:\$PYTHONPATH}"
+${DEFAULT_MODEL:+export PIPER_OLLAMA_MODEL="$DEFAULT_MODEL"}
+exec "\$PY" "\$APP_PATH" "\$@"
+EOF
     chmod +x "$PIPER_WRAPPER"
   fi
 fi

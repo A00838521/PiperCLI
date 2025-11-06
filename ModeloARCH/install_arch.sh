@@ -19,6 +19,8 @@ USE_SYSTEMD=1
 GIT_URL=""
 GIT_BRANCH=""
 ENSURE_MODELS="${ENSURE_MODELS:-mistral:7b-instruct,phi3:mini}"
+MODEL_OVERRIDE=""
+DEFAULT_MODEL=""
 RESTORE_TAR=""
 WITH_CONFIG=""
 # Opciones Arch
@@ -35,7 +37,8 @@ while [[ $# -gt 0 ]]; do
     --no-systemd) USE_SYSTEMD=0; shift ;;
     --from-git) GIT_URL="${2:-}"; shift 2 ;;
     --branch) GIT_BRANCH="${2:-}"; shift 2 ;;
-    --ensure-models) ENSURE_MODELS="${2:-}"; shift 2 ;;
+  --ensure-models) ENSURE_MODELS="${2:-}"; shift 2 ;;
+  --model) MODEL_OVERRIDE="${2:-}"; shift 2 ;;
     --restore) RESTORE_TAR="${2:-}"; shift 2 ;;
     --with-config) WITH_CONFIG="${2:-}"; shift 2 ;;
     --arch-diag) ARCH_DIAG=1; shift ;;
@@ -103,6 +106,12 @@ run "mkdir -p '$PIPER_HOME/src' '$BIN_HOME' '$PIPER_HOME/logs' '$PIPER_STATE_DIR
 # Copiar fuentes del CLI
 run "cp -r '$SRC_DIR/src/'* '$PIPER_HOME/src/'"
 
+# Si se especifica --model, forzar sólo ese modelo y usarlo por defecto en Piper
+if [[ -n "$MODEL_OVERRIDE" ]]; then
+  ENSURE_MODELS="$MODEL_OVERRIDE"
+  DEFAULT_MODEL="$MODEL_OVERRIDE"
+fi
+
 # Instalar wrapper (simple)
 if [[ -f "$SRC_DIR/bin/piper" ]]; then
   run "install -m 0755 '$SRC_DIR/bin/piper' '$PIPER_WRAPPER'"
@@ -110,17 +119,17 @@ else
   if [[ "$DRY_RUN" = 1 ]]; then
     say "+ Crear wrapper en $PIPER_WRAPPER"
   else
-    cat >"$PIPER_WRAPPER" <<'WRAP'
+    cat > "$PIPER_WRAPPER" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-PY=${PYTHON:-python3}
-PIPER_HOME="${PIPER_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/piper-cli}"
-SRC_DIR="$PIPER_HOME/src"
-APP_PATH="$PIPER_HOME/src/piper_cli.py"
-export PYTHONPATH="$SRC_DIR${PYTHONPATH:+:$PYTHONPATH}"
-
-exec "$PY" "$APP_PATH" "$@"
-WRAP
+PY=\${PYTHON:-python3}
+PIPER_HOME="\${PIPER_HOME:-\${XDG_DATA_HOME:-\$HOME/.local/share}/piper-cli}"
+SRC_DIR="\$PIPER_HOME/src"
+APP_PATH="\$PIPER_HOME/src/piper_cli.py"
+export PYTHONPATH="\$SRC_DIR\${PYTHONPATH:+:\$PYTHONPATH}"
+${DEFAULT_MODEL:+export PIPER_OLLAMA_MODEL="$DEFAULT_MODEL"}
+exec "\$PY" "\$APP_PATH" "\$@"
+EOF
     chmod +x "$PIPER_WRAPPER"
   fi
 fi

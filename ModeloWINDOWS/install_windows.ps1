@@ -10,7 +10,8 @@ Uso:
 #>
 
 param(
-  [string]$EnsureModels = $env:ENSURE_MODELS
+  [string]$EnsureModels = $env:ENSURE_MODELS,
+  [string]$Model
 )
 
 if (-not ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows))) {
@@ -54,6 +55,14 @@ set PYTHONPATH=%SRC_DIR%;%PYTHONPATH%
 "%PY%" "%PIPER_HOME%\src\piper_cli.py" %*
 endlocal
 "@ | Set-Content -LiteralPath $Wrapper -Encoding ASCII
+
+# Si se indicó -Model, usarlo como modelo por defecto y para pulls
+if ($Model) {
+  try {
+    Add-Content -LiteralPath $Wrapper -Value "`nset PIPER_OLLAMA_MODEL=$Model" -Encoding ASCII
+  } catch {}
+  $EnsureModels = $Model
+}
 
 # Asegurar Bin en PATH
 if (-not ($env:Path -split ';' | Where-Object { $_ -eq $BinHome })) {

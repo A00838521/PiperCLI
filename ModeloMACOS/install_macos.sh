@@ -14,11 +14,40 @@ fi
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/.." && pwd)"
 ENSURE_MODELS=${ENSURE_MODELS:-"mistral:7b-instruct,phi3:mini"}
+MODEL_OVERRIDE=""
+DEFAULT_MODEL=""
 DRY_RUN=${DRY_RUN:-0}
 
 say() { echo -e "$*"; }
 exists() { command -v "$1" >/dev/null 2>&1; }
 run() { if [[ "$DRY_RUN" = 1 ]]; then echo "+ $*"; else eval "$*"; fi }
+
+# Parseo de flags básicas (sólo añadimos --model para forzar un único modelo)
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --model)
+      MODEL_OVERRIDE="${2:-}"
+      shift 2
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --ensure-models)
+      ENSURE_MODELS="${2:-}"
+      shift 2
+      ;;
+    *)
+      # ignoramos otras flags (compatibilidad futura)
+      shift
+      ;;
+  esac
+done
+
+if [[ -n "$MODEL_OVERRIDE" ]]; then
+  ENSURE_MODELS="$MODEL_OVERRIDE"
+  DEFAULT_MODEL="$MODEL_OVERRIDE"
+fi
 
 # Destinos (consistentes con Linux)
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
@@ -78,6 +107,7 @@ set -euo pipefail
 PY=\${PYTHON:-python3}
 SRC_DIR="$PIPER_HOME/src"
 export PYTHONPATH="\$SRC_DIR\${PYTHONPATH:+:\$PYTHONPATH}"
+  ${DEFAULT_MODEL:+export PIPER_OLLAMA_MODEL="$DEFAULT_MODEL"}
 exec "\$PY" "$PIPER_HOME/src/piper_cli.py" "\$@"
 EOF
 fi

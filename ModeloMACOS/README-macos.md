@@ -12,7 +12,8 @@ Asistente local de terminal que convierte prompts en proyectos y respuestas úti
 ## Instalación rápida
 
 ```bash
-bash install.sh
+bash install.sh --model mistral:7b-instruct   # instala Piper y sólo ese modelo (usado por defecto)
+bash install.sh                               # instala Piper y modelos por defecto (mistral, phi3)
 ```
 
 El instalador:
@@ -113,6 +114,7 @@ Esto elimina el wrapper y los archivos bajo `~/.local/share/piper-cli`. Puedes m
 Piper CLI puede hablar si tienes un TTS local (por ejemplo, Piper TTS u otras voces). Usa `--no-tts` para silenciar. En macOS también puedes usar `piper say "Texto..."` si configuraste TTS compatible.
 
 ## Agent (ejecutor de comandos)
+
 Describe una tarea y deja que Piper planifique y ejecute comandos shell. Puede investigar en la web y preguntar antes de instalar herramientas.
 
 ```bash
@@ -120,7 +122,7 @@ Describe una tarea y deja que Piper planifique y ejecute comandos shell. Puede i
 piper agent "Crea carpeta demo y git init; inicializa React con Vite" --web --cwd ~/proyectos --no-tts
 ```
 
-```
+```md
 
 - Flags de agent:
   - `--cwd DIR` directorio de trabajo.
@@ -134,3 +136,12 @@ piper agent "Crea carpeta demo y git init; inicializa React con Vite" --web --cw
 - Controla el alcance de búsqueda de archivos:
   - `--find-current-only` limita al directorio actual.
   - `--find-base DIR` fija un directorio base.
+```
+
+### Upgrade
+Para actualizar Piper sin volver a descargar modelos:
+```bash
+bash ModeloMACOS/upgrade_macos.sh
+bash ModeloMACOS/upgrade_macos.sh --dry-run  # ver acciones
+```
+Esto re-copia fuentes y mantiene `PIPER_OLLAMA_MODEL` si estaba configurado.
