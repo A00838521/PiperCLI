@@ -5,6 +5,7 @@ Asistente local de terminal que convierte prompts en proyectos y respuestas úti
 ## Qué incluye
 
 - Asistente (`piper assist`):
+
    - Respuestas concisas tipo Copilot (sin bucles de preguntas).
    - Investigación web opcional (`--web`) o automática según el prompt (sin copiar código).
    - Intents locales: fecha/hora, IP (local/pública), OS info, búsqueda de archivos y clima.
@@ -123,50 +124,48 @@ piper config --set-max-ai-bytes 83886080 --set-max-ai-file-bytes 8388608 --enabl
 - Piper usa Ollama; por defecto intenta `mistral:7b-instruct`.
 - `--fast` fuerza `phi3:mini` para respuestas rápidas.
 
-## Roadmap
+## Roadmap y nuevas capacidades
 
 - Soporte Windows (futuro): planeado un modelo `ModeloWIN` con instaladores `.ps1` y servicio en segundo plano equivalente.
+- Extensión del inspector: análisis semántico más profundo y detección de 'hotspots' de complejidad.
+- Caché local de resúmenes web para reducir peticiones repetidas.
 
-## Agent (ejecutor de comandos)
+## Agent (ejecutor de comandos y generador de código)
 
 Permite describir una tarea en lenguaje natural y que Piper planifique y ejecute comandos shell (con confirmaciones sensibles). Usa tu sistema operativo como contexto y puede investigar en la web.
 
-```bash
 ```bash
 piper agent "Crea una carpeta demo y git init" --cwd ~/proyectos --no-tts
 ```
 
 ```sh
-
-```bash
-```bash
-piper agent "Inicializa un proyecto React (Vite) y correlo" --web --background -y --no-tts
+piper agent "Inicializa un proyecto React (Vite) y corrélo" --web --background -y --no-tts
 ```
 
 ```md
 - Flags de agent:
   - `--cwd DIR`: directorio de trabajo.
   - `--background`: ejecuta con nohup y guarda logs.
-  - `-y/--yes`: omite confirmaciones (instalaciones y también la confirmación inicial del plan).
-  - `--dry-run`: muestra primero el plan en formato árbol y sale sin ejecutar nada.
-  - `--web`, `--web-max`, `--web-timeout`: investiga en la web y usa ese contexto.
-  - `--model` / `--fast`: elige el modelo.
-  - `--no-auto-web-assist`: desactiva la asistencia automática con web en comandos desconocidos o fallos (por defecto, activada).
-  - `--no-stream`: no adjunta IO; captura y muestra al final (por defecto, streaming ON para ver e interactuar en tiempo real).
+  - `-y/--yes`: omite confirmaciones del plan.
+  - `--dry-run`: muestra el plan y sale.
+  - `--web`, `--web-max`, `--web-timeout`: investigación web contextual.
+  - `--model` / `--fast`: elige modelo Ollama.
+  - `--no-auto-web-assist`: desactiva asistencia automática en fallos.
+  - `--plan-report FILE`: guarda el plan y resultados en Markdown.
+  - `--no-auto-code`: desactiva generación de código y tests automáticos (por defecto activada).
 
 ```
 
 ```yaml
-
 ## TTS (texto a voz)
 Por defecto, TTS está desactivado. Actívalo sólo si quieres que hable:
 - Exporta `PIPER_ENABLE_TTS=1` para habilitar por defecto.
 - Usa `--no-tts` para silenciar puntualmente.
 ```
 
-## Contexto inteligente (nuevo)
+## Contexto inteligente y generación de código (nuevo)
 
-Piper mantiene un contexto persistente para evitar preguntas repetitivas y optimizar decisiones:
+Piper mantiene un contexto persistente para evitar preguntas repetitivas y optimizar decisiones, y ahora incluye generación de código autónoma (auto-code) con validación sintáctica y tests mínimos.
 
 - Herramientas rastreadas: `git`, `gh` (GitHub CLI), `node`, `npm`, `python3`, `go`.
 - Decisiones recordadas: por ejemplo, si aceptaste o rechazaste instalar `git` (`install.git`), o aplicar `AI_NOTES`.
@@ -209,11 +208,33 @@ piper --help
 
 ## Modo CTF (nuevo)
 
-Piper incluye un modo CTF protegido por clave con utilidades para recon, OSINT, cripto y reversing.
+Piper incluye un modo CTF protegido por clave con utilidades para recon, OSINT, cripto y reversing. Además añade SSTI probing y ataques de credenciales controlados (hydra) con flag legal.
 
 - Guía completa: docs/CTF.txt
 - Ejemplos rápidos:
-  - `piper ctf set-key`
-  - `piper ctf install --all`
-  - `piper ctf web --target https://victima --report recon_web.md`
-  - `piper ctf osint --domain example.com --report osint.md`
+   - `piper ctf set-key`
+   - `piper ctf install --all`
+   - `piper ctf web --target https://victima --report recon_web.md`
+   - `piper ctf osint --domain example.com --report osint.md`
+   - `piper ctf reverse --file binario --report reverse.md`
+   - `piper ctf crypto --data "SGVsbG8="`
+   - `piper ctf probe --url https://victima/ssti?x=`
+   - `piper ctf creds --service ssh --host 10.10.10.10 --legal`
+   - `piper ctf code --file script.py --report code_review.md`
+
+## Inspector de proyecto (nuevo)
+Analiza una carpeta (por defecto, el directorio actual) y genera `Inspector-Report.md` con:
+- Resumen IA del propósito y capacidades del proyecto (modelo Ollama).
+- Conteo por extensión de archivos.
+- Funciones e imports en archivos Python.
+- Interconexiones entre módulos locales.
+
+Opciones:
+- `--cwd DIR`: inspeccionar otra carpeta.
+- `--max-files N`: límite de archivos (default 500).
+- `--max-lines N`: líneas por archivo (default 2000).
+- Ejemplo:
+```bash
+piper inspect
+piper inspect --cwd src --max-files 80 --max-lines 1200
+```

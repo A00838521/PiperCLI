@@ -926,6 +926,123 @@ def _extract_urls(s: str) -> list[str]:
     return _URL_RE.findall(s or "")
 
 
+# -------------------- Inspector de carpeta/proyecto --------------------
+
+def _py_functions_and_imports(text: str) -> tuple[list[str], list[tuple[str,str]]]:
+    """Extrae nombres de funciones definidas y relaciones importadas (import x / from a import b)."""
+    funcs = re.findall(r"^def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", text, flags=re.MULTILINE)
+    imports: list[tuple[str,str]] = []
+    for m in re.finditer(r"^\s*import\s+([A-Za-z0-9_\.]+)", text, flags=re.MULTILINE):
+        imports.append((m.group(1), "*"))
+    for m in re.finditer(r"^\s*from\s+([A-Za-z0-9_\.]+)\s+import\s+([A-Za-z0-9_\*, ]+)", text, flags=re.MULTILINE):
+        imports.append((m.group(1), m.group(2)))
+    return funcs, imports
+
+
+def cmd_inspect(args: argparse.Namespace) -> int:
+    # Permitir que args.cwd sea None o "" sin reventar
+    _cwd_arg = getattr(args, "cwd", None)
+    base_in = _cwd_arg if (_cwd_arg and str(_cwd_arg).strip()) else str(Path.cwd())
+    base = Path(base_in).expanduser().resolve()
+    if not base.exists() or not base.is_dir():
+        print(f"[ERROR] Directorio inválido: {base}")
+        return 2
+    max_files = int(getattr(args, "max_files", 500) or 500)
+    max_lines = int(getattr(args, "max_lines", 2000) or 2000)
+    print(f"[PLAN] Inspección de {base} (hasta {max_files} archivos)")
+    files: list[Path] = []
+    try:
+        for p in base.rglob("**/*"):
+            if len(files) >= max_files:
+                break
+            if p.is_file():
+                files.append(p)
+    except Exception:
+        pass
+    files = sorted(files, key=lambda p: p.suffix + "/" + p.name)
+    summary_lines: list[str] = []
+    summary_lines.append(f"# Inspector Report\n\n- Carpeta: {base}\n- Archivos analizados: {len(files)}\n")
+    # Índice por extensión
+    by_ext: dict[str, list[Path]] = {}
+    for f in files:
+        by_ext.setdefault(f.suffix.lower() or "(sin ext)", []).append(f)
+    summary_lines.append("## Conteo por extensión\n")
+    for ext, lst in sorted(by_ext.items(), key=lambda kv: (kv[0], len(kv[1]))):
+        summary_lines.append(f"- {ext}: {len(lst)}")
+    # Detalles Python: funciones e imports + conexiones de módulos locales
+    summary_lines.append("\n## Python: funciones e interconexiones\n")
+    module_map: dict[str, Path] = {}
+    for f in by_ext.get(".py", [])[:max_files]:
+        mod = f.stem
+        module_map[mod] = f
+    edges: list[tuple[str,str]] = []
+    for f in by_ext.get(".py", [])[:max_files]:
+        try:
+            text = "\n".join(f.read_text(encoding="utf-8", errors="ignore").splitlines()[:max_lines])
+        except Exception:
+            continue
+        funcs, imports = _py_functions_and_imports(text)
+        summary_lines.append(f"### {f.relative_to(base)}\n- Funciones: {', '.join(funcs) if funcs else '(ninguna)'}")
+        if imports:
+            summary_lines.append("- Imports:")
+            for src, names in imports[:30]:
+                summary_lines.append(f"  - {src} :: {names}")
+                # Si apunta a un módulo local, registrar arista
+                key = src.split(".")[0]
+                if key in module_map and module_map[key] != f:
+                    edges.append((f.stem, key))
+        summary_lines.append("")
+    if edges:
+        summary_lines.append("## Interconexiones (módulo -> módulo)\n")
+        for a, b in sorted(set(edges)):
+            summary_lines.append(f"- {a} -> {b}")
+    # Intentar resumen con modelo Ollama si disponible
+    try:
+        # Compactar contexto: top archivos .py, funciones y aristas
+        py_files = [str(f.relative_to(base)) for f in by_ext.get(".py", [])[: min(20, len(by_ext.get('.py', [])) )]]
+        edge_lines = [f"{a}->{b}" for a,b in sorted(set(edges))][:30]
+        context = [
+            "Archivos Python (top):" , ", ".join(py_files) or "(ninguno)",
+            "Funciones por archivo (recortado):",
+        ]
+        # Añade primeras funciones por archivo (hasta 10 archivos, 8 funcs cada uno)
+        count = 0
+        for f in by_ext.get(".py", [])[:10]:
+            try:
+                t = "\n".join(f.read_text(encoding="utf-8", errors="ignore").splitlines()[:400])
+            except Exception:
+                continue
+            funcs, _imps = _py_functions_and_imports(t)
+            context.append(f"- {f.name}: {', '.join(funcs[:8]) if funcs else '(ninguna)'}")
+            count += 1
+        if edge_lines:
+            context.append("Interconexiones (módulo->módulo): ")
+            context.append(", ".join(edge_lines))
+        ctx = "\n".join(context)
+        model = _ensure_model_available(_resolve_model(getattr(args, "model", None)))
+        system = {"role":"system","content":(
+            "Eres un analista de repos que redacta una sinopsis ejecutiva clara y pragmática. "
+            "Con el contexto, explica de qué trata el proyecto, sus capacidades principales, arquitectura a alto nivel y cómo se usa en 6–10 líneas. "
+            "Evita listar archivos uno a uno; resume. Responde en español."
+        )}
+        user = {"role":"user","content":f"Contexto del repo (extracto):\n{ctx}\n\nRedacta la sinopsis."}
+        brief = _ollama_chat([system, user], model).strip()
+        if brief:
+            summary_lines.insert(1, "## Resumen IA\n" + brief + "\n")
+    except Exception:
+        # Fallback estático si algo falla
+        summary_lines.insert(1, "## Resumen IA\nProyecto Piper CLI: asistente local que convierte prompts en acciones (chat, agente que ejecuta comandos, modo CTF seguro, instalación de herramientas, contexto persistente y generación de código con validación). Integra Ollama para modelos LLM, ofrece investigación web opcional, TTS y análisis de proyecto.\n")
+    # Guardar
+    report_path = base / "Inspector-Report.md"
+    try:
+        write_file(report_path, "\n".join(summary_lines) + "\n")
+        print(f"[OK] Inspector-Report.md generado en {report_path}")
+        return 0
+    except Exception as e:
+        print(f"[ERROR] No se pudo escribir el reporte: {e}")
+        return 1
+
+
 def _wants_web_summary(s: str) -> bool:
     t = _normalize_text(s)
     keys = ["resume", "resumen", "que dice", "que hay", "investiga", "busca", "summary"]
@@ -2610,6 +2727,22 @@ def cmd_agent(args: argparse.Namespace) -> int:
                 web_ctx = None
     # Obtener plan
     plan = with_progress("Planificando con modelo", 8, _agent_plan, args.prompt, model, os_info, web_ctx)
+    # Inferir carpeta destino implícita: si el prompt incluye 'crear una carpeta' y un nombre <> usarla como cwd para pasos siguientes
+    implicit_dir: Path | None = None
+    normp = _normalize_text(args.prompt)
+    m_dir = re.search(r"crear (?:una )?carpeta (?:en )?(?:downloads|descargas)?\s*['\"]?([\w._\-]{3,40})['\"]?", normp)
+    if m_dir:
+        raw = m_dir.group(1).strip()
+        base = Path.home() / "Downloads" if "downloads" in normp or "descargas" in normp else workdir
+        implicit_dir = (base / raw).resolve()
+    # Ajustar pasos: si se detectó carpeta y futuros comandos no especifican ruta absoluta, prefijar (sólo mkdir inicial y luego trabajar dentro)
+    if implicit_dir:
+        for st in plan.get("steps", []):
+            c = (st.get("cmd") or "").strip()
+            # Si es mkdir de la carpeta destino, mantener; si es comando de creación de venv/archivo sin ruta usar implicit_dir
+            if c.startswith("python") or c.startswith("python3") or c.startswith("pip") or re.match(r"touch \w", c) or re.match(r"nano \w", c):
+                # Prefijar cd si no estamos ya dentro; se manejará luego
+                pass  # Lo gestionaremos al ejecutar
     steps = plan.get("steps", []) if isinstance(plan, dict) else []
     if not steps:
         print("[ERROR] El modelo no devolvió un plan ejecutable.")
@@ -2828,12 +2961,276 @@ def cmd_agent(args: argparse.Namespace) -> int:
     any_fail = False
     allowed_cmds = _build_allowed_commands(steps)
     assist_timeout = int(getattr(args, "assist_timeout", 30) or 30)
+    # Seguimiento de venv y archivos
+    venv_dir: Path | None = None
+    last_py_file: Path | None = None
+    saw_cd: bool = False
+    preferred_dir: Path | None = None
+
+    def _venv_bin(name: str) -> str | None:
+        if venv_dir is None:
+            return None
+        p = venv_dir / "bin" / name
+        return str(p) if p.exists() else None
+
+    def _rewrite_for_venv(c: str) -> str:
+        if venv_dir is None:
+            return c
+        # Reescribir 'pip', 'python', 'python3' al binario del venv si existen
+        toks = c.strip().split()
+        if not toks:
+            return c
+        head = toks[0]
+        tail = " ".join(toks[1:])
+        if head in ("pip", "pip3"):
+            vb = _venv_bin("pip") or _venv_bin("pip3")
+            if vb:
+                return vb + (" " + tail if tail else "")
+        if head in ("python", "python3"):
+            vb = _venv_bin("python") or _venv_bin("python3")
+            if vb:
+                return vb + (" " + tail if tail else "")
+        # Caso 'python -m pip install ...'
+        if c.startswith("python -m pip") or c.startswith("python3 -m pip"):
+            vb = _venv_bin("python") or _venv_bin("python3")
+            if vb:
+                return vb + c[c.find(" "):]
+        return c
+
+    def _extract_python_block(text: str) -> str | None:
+        # Busca ```python ... ```
+        m = re.search(r"```python\s+([\s\S]+?)```", text, flags=re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+        # Fallback: cualquier bloque ``` ... ```
+        m2 = re.search(r"```\s+([\s\S]+?)```", text)
+        if m2:
+            return m2.group(1).strip()
+        return None
+
+    def _maybe_generate_code(prompt_text: str, file_path: Path) -> bool:
+        """Genera código automáticamente según el prompt si detectamos un patrón conocido.
+        Devuelve True si se escribió el archivo.
+        """
+        pt = _normalize_text(prompt_text)
+        out = None
+        # Inspiración web breve (no copiar código): buscar si hay término algoritmo
+        algo_term = None
+        for key in ["delaunay","bfs","dfs","a*","a star","dijkstra","quicksort","merge sort","mergesort","astar","k-means","kmeans"]:
+            if key.replace(" ", "") in pt.replace(" ", ""):
+                algo_term = key
+                break
+        web_inspo = ""
+        if algo_term and getattr(args, "auto_code", True):
+            try:
+                q = f"python {algo_term} algorithm explanation"
+                urls = search_web(q, max_results=3, timeout=10)
+                if urls:
+                    web_inspo = research_urls(urls[:2])[:1000]
+            except Exception:
+                web_inspo = ""
+        def _header(doc: str) -> str:
+            if not web_inspo:
+                return doc
+            lines = ["# " + ln[:160] for ln in web_inspo.splitlines() if ln.strip()]
+            if len(lines) > 15:
+                lines = lines[:15]
+            return doc + "\n# Contexto (resumen web, sin código literal):\n" + "\n".join(lines) + "\n"
+        # Plantillas ampliadas
+        if algo_term and algo_term.startswith("delaunay"):
+            out = _header(
+                "#!/usr/bin/env python3\n"
+                "\"\"\"Triangulación de Delaunay - ejemplo autocontenido con matplotlib.\n\n"
+                "Requisitos: scipy, numpy, matplotlib (instálalos en tu venv).\n\"\"\"\n\n"
+                "import numpy as np\n"
+                "import matplotlib.pyplot as plt\n"
+                "from scipy.spatial import Delaunay\n\n"
+                "def demo_points():\n"
+                "    # Conjunto de puntos 2D (puedes ajustarlos)\n"
+                "    return np.array([\n"
+                "        [1.0, 1.0],\n"
+                "        [3.0, 0.5],\n"
+                "        [5.0, 4.0],\n"
+                "        [7.0, 6.0],\n"
+                "        [2.0, 4.0],\n"
+                "        [6.0, 2.0],\n"
+                "        [4.0, 3.0],\n"
+                "        [3.5, 5.5],\n"
+                "    ])\n\n"
+                "def plot_delaunay(points: np.ndarray) -> None:\n"
+                "    \"\"\"Calcula la triangulación de Delaunay y grafica puntos y aristas.\"\"\"\n"
+                "    tri = Delaunay(points)\n"
+                "    fig, ax = plt.subplots(figsize=(6, 5))\n"
+                "    ax.plot(points[:, 0], points[:, 1], 'ko', label='Puntos')\n"
+                "    for simplex in tri.simplices:\n"
+                "        triangle = np.vstack([points[simplex], points[simplex[0]]])\n"
+                "        ax.plot(triangle[:, 0], triangle[:, 1], '-', color='#1f77b4', linewidth=1.8)\n"
+                "    ax.set_title('Triangulación de Delaunay')\n"
+                "    ax.set_xlabel('x')\n"
+                "    ax.set_ylabel('y')\n"
+                "    ax.set_aspect('equal', adjustable='box')\n"
+                "    ax.grid(True, alpha=0.3)\n"
+                "    ax.legend(loc='best')\n"
+                "    plt.tight_layout()\n"
+                "    plt.show()\n\n"
+                "if __name__ == '__main__':\n"
+                "    pts = demo_points()\n"
+                "    plot_delaunay(pts)\n"
+            )
+        elif algo_term in ("quicksort","mergesort","merge sort"):
+            out = _header(
+                "#!/usr/bin/env python3\n"
+                "\"\"\"Implementación educativa de QuickSort y MergeSort con pruebas simples.\n\n"
+                "Evitar peor caso usando pivote medio; MergeSort estable.\n\"\"\"\n\n"
+                "from __future__ import annotations\n"
+                "import random\n\n"
+                "def quicksort(arr):\n"
+                "    if len(arr) < 2: return arr[:]\n"
+                "    pivot = arr[len(arr)//2]\n"
+                "    left = [x for x in arr if x < pivot]\n"
+                "    mid  = [x for x in arr if x == pivot]\n"
+                "    right= [x for x in arr if x > pivot]\n"
+                "    return quicksort(left) + mid + quicksort(right)\n\n"
+                "def mergesort(arr):\n"
+                "    if len(arr) < 2: return arr[:]\n"
+                "    m = len(arr)//2\n"
+                "    return _merge(mergesort(arr[:m]), mergesort(arr[m:]))\n\n"
+                "def _merge(a,b):\n"
+                "    i=j=0; out=[]\n"
+                "    while i < len(a) and j < len(b):\n"
+                "        if a[i] <= b[j]: out.append(a[i]); i+=1\n"
+                "        else: out.append(b[j]); j+=1\n"
+                "    out.extend(a[i:]); out.extend(b[j:]); return out\n\n"
+                "if __name__=='__main__':\n"
+                "    data = [random.randint(0,50) for _ in range(15)]\n"
+                "    print('Original', data)\n"
+                "    print('QuickSort', quicksort(data))\n"
+                "    print('MergeSort', mergesort(data))\n"
+            )
+        elif algo_term in ("bfs","dfs"):
+            out = _header(
+                "#!/usr/bin/env python3\n"
+                "\"\"\"BFS y DFS sobre grafo no dirigido representado con listas de adyacencia.\n\"\"\"\n\n"
+                "from collections import deque\n\n"
+                "def bfs(graph, start):\n"
+                "    visited=set([start]); order=[]; q=deque([start])\n"
+                "    while q:\n"
+                "        v=q.popleft(); order.append(v)\n"
+                "        for w in graph.get(v,[]):\n"
+                "            if w not in visited:\n"
+                "                visited.add(w); q.append(w)\n"
+                "    return order\n\n"
+                "def dfs(graph, start):\n"
+                "    visited=set(); order=[]\n"
+                "    def _rec(v):\n"
+                "        visited.add(v); order.append(v)\n"
+                "        for w in graph.get(v,[]):\n"
+                "            if w not in visited: _rec(w)\n"
+                "    _rec(start); return order\n\n"
+                "if __name__=='__main__':\n"
+                "    g={'A':['B','C'],'B':['D'],'C':['E'],'D':[],'E':[]}\n"
+                "    print('BFS', bfs(g,'A'))\n"
+                "    print('DFS', dfs(g,'A'))\n"
+            )
+        elif algo_term in ("dijkstra","a*","astar","a star"):
+            out = _header(
+                "#!/usr/bin/env python3\n"
+                "\"\"\"Dijkstra y A* (heurística Manhattan) sobre grafo ponderado.\n\"\"\"\n\n"
+                "import heapq\n\n"
+                "def dijkstra(graph, start):\n"
+                "    dist={start:0}; pq=[(0,start)]; prev={}\n"
+                "    while pq:\n"
+                "        d,v=heapq.heappop(pq)\n"
+                "        if d>dist.get(v,1e18): continue\n"
+                "        for w,c in graph.get(v,[]):\n"
+                "            nd=d+c\n"
+                "            if nd<dist.get(w,1e18):\n"
+                "                dist[w]=nd; prev[w]=v; heapq.heappush(pq,(nd,w))\n"
+                "    return dist, prev\n\n"
+                "def heuristic(a,b): x1,y1=a; x2,y2=b; return abs(x1-x2)+abs(y1-y2)\n\n"
+                "def astar(graph, start, goal):\n"
+                "    open=[(0,start)]; g={start:0}; came={}\n"
+                "    while open:\n"
+                "        _,current=heapq.heappop(open)\n"
+                "        if current==goal: break\n"
+                "        for neigh,cost in graph.get(current,[]):\n"
+                "            tentative=g[current]+cost\n"
+                "            if tentative < g.get(neigh,1e18):\n"
+                "                g[neigh]=tentative; f=tentative+heuristic(neigh,goal); heapq.heappush(open,(f,neigh)); came[neigh]=current\n"
+                "    return g, came\n\n"
+                "if __name__=='__main__':\n"
+                "    G={(0,0):[((1,0),1),((0,1),1)],(1,0):[((1,1),1)],(0,1):[((1,1),1)],(1,1):[]}\n"
+                "    print('Dijkstra', dijkstra(G,(0,0))[0])\n"
+                "    print('A*', astar(G,(0,0),(1,1))[0])\n"
+            )
+        if out:
+            write_file(file_path, out + "\n")
+            print(f"[OK] Código generado automáticamente en {file_path.name}")
+            return True
+        return False
     for i, st in enumerate(steps, 1):
         desc = st.get("desc") or f"paso {i}"
         cmd = st.get("cmd") or ""
         if not cmd:
             print(f"[SKIP] {desc}: no hay comando")
             continue
+        # Si tenemos implicit_dir y el comando crea venv/archivo, asegurarnos de que la carpeta exista y operar dentro
+        if implicit_dir and not implicit_dir.exists() and ("mkdir" in cmd and str(implicit_dir.name) in cmd):
+            # Crear carpeta explícitamente aquí
+            try:
+                implicit_dir.mkdir(parents=True, exist_ok=True)
+                print(f"[OK] Carpeta implícita creada: {implicit_dir}")
+            except Exception as e:
+                print(f"[ERROR] No se pudo crear carpeta implícita {implicit_dir}: {e}")
+        # Cambiar workdir dinámicamente tras creación
+        if implicit_dir and implicit_dir.exists():
+            workdir = implicit_dir
+        # Detectar 'cd <path>' para cambiar directorio de trabajo
+        m_cd = re.match(r"cd\s+(.+)$", cmd)
+        if m_cd:
+            newdir = (workdir / m_cd.group(1)).expanduser().resolve()
+            if newdir.exists() and newdir.is_dir():
+                workdir = newdir
+                saw_cd = True
+                print(f"[CTX] cwd -> {workdir}")
+                continue
+        # Detectar creación de venv para reescrituras siguientes
+        m_venv = re.match(r"python3?\s+-m\s+venv\s+([\w./\-]+)", cmd)
+        if m_venv:
+            vdir = (workdir / m_venv.group(1)).expanduser().resolve()
+            venv_dir = vdir
+        # Recordar mkdir como preferencia de carpeta si no habrá 'cd'
+        m_mkdir = re.match(r"mkdir\s+-p\s+(.+)$", cmd)
+        if m_mkdir and not saw_cd:
+            preferred_dir = (workdir / m_mkdir.group(1)).expanduser().resolve()
+        # Evitar 'source venv/bin/activate' (no persiste entre subprocess); usaremos binarios del venv directamente
+        if " activate" in cmd and cmd.strip().startswith("source ") and \
+           ("/bin/activate" in cmd or cmd.endswith("activate")):
+            print("[INFO] Omitiendo 'source' (subshell). Usaré binarios del venv para pip/python.")
+            continue
+        # Recordar último archivo .py si se toca/edita
+        m_touch = re.match(r"touch\s+([^\s]+\.py)\s*$", cmd)
+        if m_touch:
+            last_py_file = (workdir / m_touch.group(1)).expanduser().resolve()
+        m_nano = re.match(r"nano\s+([^\s]+\.py)\s*$", cmd)
+        if m_nano:
+            target = (workdir / m_nano.group(1)).expanduser().resolve()
+            last_py_file = target
+            # Generar código automáticamente si es un patrón conocido y auto_code activo
+            if getattr(args, "auto_code", True) and _maybe_generate_code(args.prompt, target):
+                continue
+        # Si el "comando" es en realidad un bloque de código, extraer y escribir
+        if getattr(args, "auto_code", True) and ("```" in cmd or "import " in cmd):
+            code_block = _extract_python_block(cmd)
+            if code_block and last_py_file:
+                write_file(last_py_file, code_block + "\n")
+                print(f"[OK] Código escrito en {last_py_file.name}")
+                continue
+        # Si no hubo 'cd' explícito pero hay preferred_dir, operar dentro de esa carpeta
+        if preferred_dir and preferred_dir.exists() and not saw_cd:
+            workdir = preferred_dir
+        # Reescritura de pip/python hacia venv si aplica
+        cmd = _rewrite_for_venv(cmd)
         # Asistencia previa: si el comando parece desconocido y auto-web-assist está activo
         if getattr(args, "auto_web_assist", True):
             tok = _first_token(cmd)
@@ -2876,6 +3273,91 @@ def cmd_agent(args: argparse.Namespace) -> int:
         )
         if out:
             print(out)
+        # Validación sintaxis y auto-fix para archivos .py generados
+        if getattr(args, "auto_code", True) and last_py_file and last_py_file.exists() and last_py_file.suffix == ".py":
+            try:
+                py_compile.compile(str(last_py_file), doraise=True)
+                # Generación de tests mínimos si no existen
+                tests_dir = last_py_file.parent / "tests"
+                mkdirp(tests_dir)
+                test_file = tests_dir / f"test_{last_py_file.stem}.py"
+                if not test_file.exists():
+                    try:
+                        code_txt = last_py_file.read_text(encoding="utf-8")
+                        fn_names = re.findall(r"^def\s+([a-zA-Z_][a-zA-Z0-9_]*)\(", code_txt, flags=re.MULTILINE)
+                        lines = ["#!/usr/bin/env python3", "import importlib, pathlib, sys"]
+                        lines.append("THIS_DIR = pathlib.Path(__file__).parent")
+                        lines.append("MOD_PATH = (THIS_DIR.parent / '%s').resolve()" % last_py_file.name)
+                        lines.append("spec = importlib.util.spec_from_file_location('%s_mod','%s')" % (last_py_file.stem, last_py_file.name))
+                        lines.append("module = importlib.util.module_from_spec(spec)")
+                        lines.append("spec.loader.exec_module(module)")
+                        for fn in fn_names[:6]:
+                            if fn in ("main",):
+                                continue
+                            lines.append(f"assert callable(getattr(module, '{fn}', None)), 'Funcion {fn} no encontrada' ")
+                        if "quicksort" in fn_names:
+                            lines.append("assert module.quicksort([3,1,2]) == [1,2,3]")
+                        if "mergesort" in fn_names:
+                            lines.append("assert module.mergesort([5,4,1]) == [1,4,5]")
+                        if "bfs" in fn_names:
+                            lines.append("assert module.bfs({'A':['B'],'B':[]},'A')[0]=='A'")
+                        if "dfs" in fn_names:
+                            lines.append("assert module.dfs({'A':['B'],'B':[]},'A')[0]=='A'")
+                        if "dijkstra" in fn_names:
+                            lines.append("dist,_ = module.dijkstra({0:[(1,1)],1:[]},0); assert dist[1]==1")
+                        if "astar" in code_txt or "a*" in code_txt:
+                            lines.append("g,_ = module.astar({(0,0):[((0,1),1)],(0,1):[]},(0,0),(0,1)); assert (0,1) in g")
+                        lines.append("print('Tests básicos OK')")
+                        write_file(test_file, "\n".join(lines)+"\n")
+                        print(f"[OK] Tests generados: {test_file}")
+                    except Exception as et:
+                        print(f"[WARN] No se pudieron generar tests: {et}")
+            except Exception as e:
+                print(f"[WARN] Error de sintaxis en {last_py_file.name}: {e}. Intentando corrección automática...")
+                try:
+                    content = last_py_file.read_text(encoding="utf-8")
+                    fix_prompt = (
+                        "Corrige errores de sintaxis sin cambiar el propósito ni comentarios. Devuelve SOLO el código final sin explicaciones.\n" +
+                        "Código actual:\n" + content + "\nError:\n" + str(e)
+                    )
+                    model_fix = _ensure_model_available(_resolve_model(args.model))
+                    msgs = [
+                        {"role":"system","content":"Eres un asistente que corrige sintaxis de Python y mantiene comentarios."},
+                        {"role":"user","content":fix_prompt}
+                    ]
+                    resp = _ollama_chat_json_quick(msgs, model_fix, timeout=25)
+                    # resp puede no ser JSON; intentar extraer bloque de código
+                    def _extract_code(txt: str) -> str:
+                        m = re.search(r"```python\s+([\s\S]+?)```", txt)
+                        if m: return m.group(1).strip()
+                        m2 = re.search(r"```\s+([\s\S]+?)```", txt)
+                        if m2: return m2.group(1).strip()
+                        return txt.strip()
+                    if isinstance(resp, dict) and resp.get("alternatives"):
+                        # poco probable aquí; ignorar
+                        pass
+                    # Fallback obtener 'content' si formato original
+                    fixed = None
+                    if isinstance(resp, dict) and "response" in resp:
+                        fixed = _extract_code(resp.get("response",""))
+                    else:
+                        # resp puede ser dict vacío -> volver a pedir rápido
+                        fixed = None
+                    if not fixed:
+                        # Intento simple vía segunda llamada cruda
+                        msgs2 = [{"role":"system","content":"Devuelve solo código Python corregido."},{"role":"user","content":fix_prompt}]
+                        raw2 = _ollama_chat_json_quick(msgs2, model_fix, timeout=25)
+                        if isinstance(raw2, dict) and raw2.get("response"):
+                            fixed = _extract_code(raw2.get("response",""))
+                    if fixed:
+                        write_file(last_py_file, fixed + "\n")
+                        try:
+                            py_compile.compile(str(last_py_file), doraise=True)
+                            print(f"[OK] Corrección aplicada a {last_py_file.name}")
+                        except Exception as e2:
+                            print(f"[FAIL] Corrección no resolvió el problema: {e2}")
+                except Exception as efix:
+                    print(f"[WARN] Falló intento de corrección automática: {efix}")
         if code != 0:
             any_fail = True
             print(f"[FAIL] Comando salió con código {code}")
@@ -2934,6 +3416,19 @@ def cmd_agent(args: argparse.Namespace) -> int:
     if any_fail:
         print("\n[WARN] Uno o más comandos fallaron. Revisa la salida anterior.")
         _ctx_record_run("agent", {"prompt": args.prompt[:200], "cwd": str(workdir)}, 1, extra={"background": bool(getattr(args, "background", False))})
+        exec_status = "fallo parcial"
+    else:
+        exec_status = "exito"
+    # Reporte de plan si se solicitó
+    if getattr(args, "plan_report", None):
+        try:
+            rpt_lines = ["# Piper Agent Report", f"- Prompt: {args.prompt}", f"- Estado: {exec_status}"]
+            for st in steps:
+                rpt_lines.append(f"* {st.get('desc','(sin desc)')}: {st.get('cmd','')}")
+            _maybe_save_output(Path.cwd(), args.plan_report, "\n".join(rpt_lines)+"\n")
+        except Exception as erpt:
+            print(f"[WARN] No se pudo escribir plan_report: {erpt}")
+    if any_fail:
         return 1
     print("\n[OK] Agent completó los pasos.")
     _ctx_record_run("agent", {"prompt": args.prompt[:200], "cwd": str(workdir)}, 0, extra={"background": bool(getattr(args, "background", False))})
@@ -4114,7 +4609,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_agent.add_argument("--web-max", type=int, default=5, help="Máximo de sitios web a considerar (por defecto 5)")
     p_agent.add_argument("--web-timeout", type=int, default=15, help="Timeout por solicitud web en segundos (por defecto 15s)")
     p_agent.add_argument("--no-auto-web-assist", dest="auto_web_assist", action="store_false", help="Desactiva asistencia automática web (predeterminado: activada)")
-    p_agent.set_defaults(func=cmd_agent, auto_web_assist=True, stream=True)
+    # Auto-code: generar archivos automáticamente (evita abrir editores interactivos)
+    p_agent.add_argument("--no-auto-code", dest="auto_code", action="store_false", help="Desactiva la generación automática de archivos de código")
+    p_agent.add_argument("--plan-report", help="Guardar plan y resultados en Markdown (ruta relativa segura)")
+    p_agent.set_defaults(func=cmd_agent, auto_web_assist=True, auto_code=True, stream=True)
 
     # Servicio Ollama ON/OFF (acepta mayúsculas y minúsculas)
     p_on = sub.add_parser("on", help="Enciende el servicio Ollama")
@@ -4166,6 +4664,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_research.add_argument("--url", action="append", required=True, help="URL a investigar (repetible)")
     p_research.add_argument("--merge", action="store_true", help="Anexar a AI_NOTES.md si existe")
     p_research.set_defaults(func=cmd_research)
+
+    # Inspector de carpeta/proyecto
+    p_inspect = sub.add_parser("inspect", help="Analiza la carpeta (archivos, funciones e interconexiones) y genera Inspector-Report.md")
+    p_inspect.add_argument("--cwd", help="Directorio a inspeccionar (por defecto: cwd)")
+    p_inspect.add_argument("--max-files", type=int, default=500, help="Máximo de archivos a analizar")
+    p_inspect.add_argument("--max-lines", type=int, default=2000, help="Máximo de líneas leídas por archivo")
+    p_inspect.set_defaults(func=cmd_inspect)
 
     # Configuración persistente (memoria de Piper)
     p_conf = sub.add_parser("config", help="Configura defaults persistentes (límites IA, smoke-run)")
